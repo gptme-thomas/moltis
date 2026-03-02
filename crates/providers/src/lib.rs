@@ -23,6 +23,9 @@ pub mod github_copilot;
 #[cfg(feature = "provider-kimi-code")]
 pub mod kimi_code;
 
+#[cfg(feature = "provider-claude-cli")]
+pub mod claude_cli;
+
 #[cfg(feature = "local-llm")]
 pub mod local_gguf;
 
@@ -1965,6 +1968,12 @@ impl ProviderRegistry {
             reg.register_kimi_code_providers(config, env_overrides);
         }
 
+        // Claude Code CLI provider (no API key needed, uses subscription)
+        #[cfg(feature = "provider-claude-cli")]
+        {
+            reg.register_claude_cli_providers(config);
+        }
+
         // Local GGUF providers (no API key needed, model runs locally)
         #[cfg(feature = "local-llm")]
         {
@@ -2702,6 +2711,63 @@ impl ProviderRegistry {
                 provider,
             );
         }
+    }
+
+    /// Register Claude Code CLI providers.
+    ///
+    /// The `claude-cli` provider delegates to `claude --print` as a subprocess,
+    /// using the user's Claude subscription. No API key is needed. It registers
+    /// all known Claude models so the user can select from the Moltis UI.
+    #[cfg(feature = "provider-claude-cli")]
+    fn register_claude_cli_providers(&mut self, config: &ProvidersConfig) {
+        if !config.is_enabled("claude-cli") {
+            return;
+        }
+
+        // Check that the `claude` binary exists on PATH.
+        let claude_binary = config
+            .get("claude-cli")
+            .and_then(|e| e.base_url.clone()) // Reuse base_url field for binary path.
+            .unwrap_or_else(|| "claude".into());
+
+        let preferred = configured_models_for_provider(config, "claude-cli");
+        let discovered: Vec<DiscoveredModel> = if preferred.is_empty() {
+            // Default to a useful set of Claude models.
+            vec![
+                DiscoveredModel::new("claude-sonnet-4-6", "Claude Sonnet 4.6 (CLI)"),
+                DiscoveredModel::new("claude-opus-4-6", "Claude Opus 4.6 (CLI)"),
+                DiscoveredModel::new("claude-haiku-4-5-20251001", "Claude Haiku 4.5 (CLI)"),
+            ]
+        } else {
+            Vec::new()
+        };
+        let models = merge_preferred_and_discovered_models(preferred, discovered);
+
+        for model in models {
+            let (model_id, display_name, created_at) =
+                (model.id, model.display_name, model.created_at);
+            if self.has_provider_model("claude-cli", &model_id) {
+                continue;
+            }
+            let provider = Arc::new(
+                claude_cli::ClaudeCliProvider::new(model_id.clone())
+                    .with_binary(claude_binary.clone()),
+            );
+            self.register(
+                ModelInfo {
+                    id: model_id,
+                    provider: "claude-cli".into(),
+                    display_name,
+                    created_at,
+                },
+                provider,
+            );
+        }
+
+        tracing::info!(
+            binary = %claude_binary,
+            "claude-cli provider registered"
+        );
     }
 
     #[cfg(feature = "local-llm")]

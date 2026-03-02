@@ -15,6 +15,7 @@ provider-async-openai   = ["dep:async-openai"]
 provider-genai          = ["dep:genai"]
 provider-github-copilot = ["dep:moltis-oauth"]
 provider-kimi-code      = ["dep:moltis-oauth"]
+provider-claude-cli     = []
 provider-openai-codex   = ["dep:base64", "dep:moltis-oauth"]
 
 [dependencies]

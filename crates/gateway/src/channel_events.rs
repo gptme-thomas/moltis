@@ -326,77 +326,69 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 params["_audio_filename"] = serde_json::json!(audio_filename);
             }
 
-            // Forward the channel's default model to chat.send() if configured.
-            // If no channel model is set, check if the session already has a model.
-            // If neither exists, assign the first registered model so the session
-            // behaves the same as the web UI (which always sends an explicit model).
-            if let Some(ref model) = meta.model {
+            // Resolve which model to use for this message.
+            // Priority: session model (user chose via /model) > channel config > first registered.
+            let session_model = if let Some(ref sm) = state.services.session_metadata {
+                sm.get(&session_key).await.and_then(|e| e.model)
+            } else {
+                None
+            };
+
+            if let Some(ref sm) = session_model {
+                // Session already has a model (set via /model or persisted earlier).
+                params["model"] = serde_json::json!(sm);
+            } else if let Some(ref model) = meta.model {
+                // No session model yet — use the channel's configured default.
                 params["model"] = serde_json::json!(model);
 
-                // Notify the user which model was assigned from the channel config
-                // on the first message of a new session (no model set yet).
-                let session_has_model = if let Some(ref sm) = state.services.session_metadata {
-                    sm.get(&session_key).await.and_then(|e| e.model).is_some()
-                } else {
-                    false
-                };
-                if !session_has_model {
-                    // Persist channel model on the session.
-                    let _ = state
-                        .services
-                        .session
-                        .patch(serde_json::json!({
-                            "key": &session_key,
-                            "model": model,
-                        }))
-                        .await;
+                // Persist channel model on the session.
+                let _ = state
+                    .services
+                    .session
+                    .patch(serde_json::json!({
+                        "key": &session_key,
+                        "model": model,
+                    }))
+                    .await;
 
-                    // Buffer model notification for the logbook instead of sending separately.
-                    let display: String = if let Ok(models_val) = state.services.model.list().await
-                        && let Some(models) = models_val.as_array()
-                    {
-                        models
-                            .iter()
-                            .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model))
-                            .and_then(|m| m.get("displayName").and_then(|v| v.as_str()))
-                            .unwrap_or(model)
-                            .to_string()
-                    } else {
-                        model.clone()
-                    };
-                    let msg = format!("Using {display}. Use /model to change.");
-                    state.push_channel_status_log(&session_key, msg).await;
-                }
-            } else {
-                let session_has_model = if let Some(ref sm) = state.services.session_metadata {
-                    sm.get(&session_key).await.and_then(|e| e.model).is_some()
-                } else {
-                    false
-                };
-                if !session_has_model
-                    && let Ok(models_val) = state.services.model.list().await
+                // Buffer model notification for the logbook instead of sending separately.
+                let display: String = if let Ok(models_val) = state.services.model.list().await
                     && let Some(models) = models_val.as_array()
-                    && let Some(first) = models.first()
-                    && let Some(id) = first.get("id").and_then(|v| v.as_str())
                 {
-                    params["model"] = serde_json::json!(id);
-                    let _ = state
-                        .services
-                        .session
-                        .patch(serde_json::json!({
-                            "key": &session_key,
-                            "model": id,
-                        }))
-                        .await;
+                    models
+                        .iter()
+                        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model.as_str()))
+                        .and_then(|m| m.get("displayName").and_then(|v| v.as_str()))
+                        .unwrap_or(model)
+                        .to_string()
+                } else {
+                    model.clone()
+                };
+                let msg = format!("Using {display}. Use /model to change.");
+                state.push_channel_status_log(&session_key, msg).await;
+            } else if let Ok(models_val) = state.services.model.list().await
+                && let Some(models) = models_val.as_array()
+                && let Some(first) = models.first()
+                && let Some(id) = first.get("id").and_then(|v| v.as_str())
+            {
+                // No session model and no channel model — use first registered model.
+                params["model"] = serde_json::json!(id);
+                let _ = state
+                    .services
+                    .session
+                    .patch(serde_json::json!({
+                        "key": &session_key,
+                        "model": id,
+                    }))
+                    .await;
 
-                    // Buffer model notification for the logbook.
-                    let display = first
-                        .get("displayName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(id);
-                    let msg = format!("Using {display}. Use /model to change.");
-                    state.push_channel_status_log(&session_key, msg).await;
-                }
+                // Buffer model notification for the logbook.
+                let display = first
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(id);
+                let msg = format!("Using {display}. Use /model to change.");
+                state.push_channel_status_log(&session_key, msg).await;
             }
 
             let send_result = chat.send(params).await;

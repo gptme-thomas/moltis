@@ -50,6 +50,49 @@ impl PiperTts {
         }
         path.to_string()
     }
+
+    /// Convert raw 16-bit mono 22050 Hz PCM to the target format via ffmpeg.
+    async fn convert_pcm_via_ffmpeg(pcm: &[u8], target: AudioFormat) -> Result<Bytes> {
+        let (ffmpeg_codec, ffmpeg_format) = match target {
+            AudioFormat::Mp3 => ("libmp3lame", "mp3"),
+            AudioFormat::Opus => ("libopus", "ogg"),
+            AudioFormat::Aac => ("aac", "adts"),
+            AudioFormat::Webm => ("libopus", "webm"),
+            AudioFormat::Pcm => return Ok(Bytes::copy_from_slice(pcm)),
+        };
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-f", "s16le",   // raw PCM input
+            "-ar", "22050",  // sample rate
+            "-ac", "1",      // mono
+            "-i", "pipe:0",  // read from stdin
+            "-c:a", ffmpeg_codec,
+            "-f", ffmpeg_format,
+            "pipe:1",        // write to stdout
+        ]);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow!("Failed to spawn ffmpeg for audio conversion: {e}. Is ffmpeg installed?")
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(pcm).await?;
+            stdin.shutdown().await?;
+        }
+
+        let output = child.wait_with_output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("ffmpeg conversion failed: {stderr}"));
+        }
+
+        Ok(Bytes::from(output.stdout))
+    }
 }
 
 #[async_trait]
@@ -140,21 +183,29 @@ impl TtsProvider for PiperTts {
             return Err(anyhow!("Piper failed: {}", stderr));
         }
 
-        // Piper outputs raw 16-bit PCM at 22050 Hz by default
-        // Convert to requested format if needed
+        // Piper outputs raw 16-bit PCM at 22050 Hz mono.
+        let raw_pcm = output.stdout;
+
+        // Estimate duration from raw PCM size (16-bit mono @ 22050 Hz = 2 bytes/sample).
+        let duration_ms = if !raw_pcm.is_empty() {
+            Some((raw_pcm.len() as u64) * 1000 / (22050 * 2))
+        } else {
+            None
+        };
+
+        // Convert to requested format via ffmpeg if needed.
         let (data, format) = match request.output_format {
-            AudioFormat::Pcm => (Bytes::from(output.stdout), AudioFormat::Pcm),
-            AudioFormat::Mp3 | AudioFormat::Opus | AudioFormat::Aac | AudioFormat::Webm => {
-                // For other formats, we'd need ffmpeg conversion
-                // For now, return PCM and let caller handle conversion
-                (Bytes::from(output.stdout), AudioFormat::Pcm)
-            },
+            AudioFormat::Pcm => (Bytes::from(raw_pcm), AudioFormat::Pcm),
+            target => {
+                let converted = Self::convert_pcm_via_ffmpeg(&raw_pcm, target).await?;
+                (converted, target)
+            }
         };
 
         Ok(AudioOutput {
             data,
             format,
-            duration_ms: None,
+            duration_ms,
         })
     }
 }

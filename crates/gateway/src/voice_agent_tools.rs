@@ -111,7 +111,7 @@ impl AgentTool for SpeakTool {
     }
 
     fn description(&self) -> &str {
-        "Convert text to speech. Use when the user asks for audio/voice output. Returns an audio file path and metadata."
+        "Convert text to speech. Use when the user asks for audio/voice output. Returns an audio file path and metadata. IMPORTANT: After calling this tool, always include a text reply (e.g. repeat or summarize what was spoken) so the response is delivered to the user."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -120,7 +120,7 @@ impl AgentTool for SpeakTool {
             "required": ["text"],
             "properties": {
                 "text": { "type": "string", "description": "Text to synthesize." },
-                "provider": { "type": "string", "description": "Optional TTS provider override." },
+                "provider": { "type": "string", "description": "Optional TTS provider override. Omit to use the configured default." },
                 "format": { "type": "string", "enum": ["ogg", "opus", "mp3", "aac", "pcm"], "description": "Output format. Use ogg/opus for voice notes." },
                 "voiceId": { "type": "string", "description": "Optional voice ID." },
                 "model": { "type": "string", "description": "Optional provider model override." },
@@ -137,10 +137,10 @@ impl AgentTool for SpeakTool {
 
         let request = TtsConvertParams {
             text: input.text,
-            provider: input.provider,
+            provider: input.provider.filter(|s| !s.is_empty()),
             format: input.format,
-            voice_id: input.voice_id,
-            model: input.model,
+            voice_id: input.voice_id.filter(|s| !s.is_empty()),
+            model: input.model.filter(|s| !s.is_empty()),
             speed: input.speed,
             stability: input.stability,
             similarity_boost: input.similarity_boost,

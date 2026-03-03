@@ -211,7 +211,11 @@ impl LiveTtsService {
         params: &Value,
         config_provider: &str,
     ) -> Result<TtsProviderId, ServiceError> {
-        match params.get("provider").and_then(|v| v.as_str()) {
+        match params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             Some(s) => TtsProviderId::parse(s)
                 .ok_or_else(|| ServiceError::message(format!("unknown TTS provider '{s}'"))),
             None => Self::resolve_provider(config_provider)

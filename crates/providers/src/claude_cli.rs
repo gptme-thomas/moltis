@@ -12,8 +12,10 @@
 //! for Moltis-native tool calling since the subprocess runs its own agent loop.
 
 use std::pin::Pin;
+use std::sync::Mutex;
 
 use {async_trait::async_trait, tokio_stream::Stream};
+use uuid::Uuid;
 
 use tracing::{debug, trace, warn};
 
@@ -29,6 +31,9 @@ pub struct ClaudeCliProvider {
     system_prompt: Option<String>,
     /// Path to the `claude` binary. Defaults to "claude" (resolved via PATH).
     claude_binary: String,
+    /// Tracks the active session UUID for `--resume` across multi-turn tool loops.
+    /// `None` means no active session (next call starts fresh with `--session-id`).
+    active_session: Mutex<Option<String>>,
 }
 
 impl ClaudeCliProvider {
@@ -38,6 +43,7 @@ impl ClaudeCliProvider {
             model,
             system_prompt: None,
             claude_binary: "claude".into(),
+            active_session: Mutex::new(None),
         }
     }
 
@@ -56,25 +62,85 @@ impl ClaudeCliProvider {
         self
     }
 
-    /// Build the CLI arguments for a `claude --print` invocation.
-    fn build_args(&self, prompt: &str) -> Vec<String> {
+    /// Build CLI arguments and prompt for a `claude --print` invocation,
+    /// handling session resume for multi-turn conversations and tool loops.
+    ///
+    /// Returns `(args, prompt_text)` where `args` includes the prompt as
+    /// the last positional argument.
+    ///
+    /// - **Resume** (active session exists): uses `--resume`, sends only the
+    ///   new content — tool results or the latest user message.
+    /// - **Fresh** (no active session): generates a new session UUID, uses
+    ///   `--session-id`, sends the full flattened prompt.
+    fn build_session_args(
+        &self,
+        messages: &[ChatMessage],
+        output_format: &str,
+    ) -> (Vec<String>, String) {
         let mut args = vec![
             "--print".into(),
             "--output-format".into(),
-            "stream-json".into(),
+            output_format.into(),
             "--model".into(),
             self.model.clone(),
-            "--no-session-persistence".into(),
             "--verbose".into(),
+            "--dangerously-skip-permissions".into(),
         ];
 
-        if let Some(ref sys) = self.system_prompt {
-            args.push("--append-system-prompt".into());
-            args.push(sys.clone());
+        // Resume existing session if we have one.
+        let existing = self
+            .active_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(sid) = existing {
+            args.push("--resume".into());
+            args.push(sid);
+            let prompt = new_content_for_resume(messages);
+            debug!(
+                resume = true,
+                prompt_len = prompt.len(),
+                "claude-cli resuming session"
+            );
+            args.push(prompt.clone());
+            return (args, prompt);
         }
 
-        args.push(prompt.into());
-        args
+        // No active session — start fresh with the full flattened prompt.
+        let (extra_system, prompt) = messages_to_prompt(messages);
+        let session_id = Uuid::new_v4().to_string();
+
+        args.push("--session-id".into());
+        args.push(session_id.clone());
+
+        *self
+            .active_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
+
+        // Merge system prompts from struct config and from messages.
+        let merged_system = match (&self.system_prompt, &extra_system) {
+            (Some(base), Some(extra)) => Some(format!("{base}\n\n{extra}")),
+            (Some(base), None) => Some(base.clone()),
+            (None, Some(extra)) => Some(extra.clone()),
+            (None, None) => None,
+        };
+
+        if let Some(sys) = merged_system {
+            args.push("--append-system-prompt".into());
+            args.push(sys);
+        }
+
+        args.push(prompt.clone());
+        (args, prompt)
+    }
+
+    /// Clear the active session (e.g. on error, so the next call starts fresh).
+    fn clear_session(&self) {
+        *self
+            .active_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -146,6 +212,58 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> (Option<String>, String) {
     };
 
     (system, prompt)
+}
+
+/// Extract only the new content to send on a `--resume` call.
+///
+/// - If the last message is a `Tool` result: sends tool results since the last
+///   assistant message.
+/// - If the last message is a `User` message: sends just the user text.
+/// - Otherwise: sends "Continue."
+fn new_content_for_resume(messages: &[ChatMessage]) -> String {
+    match messages.last() {
+        Some(ChatMessage::Tool { .. }) => tool_results_since_last_assistant(messages),
+        Some(ChatMessage::User { content }) => match content {
+            UserContent::Text(text) => text.clone(),
+            UserContent::Multimodal(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    moltis_agents::model::ContentPart::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+        _ => "Continue.".into(),
+    }
+}
+
+/// Extract only the tool results since the last assistant message.
+///
+/// Walks backward from the end of the message list, collecting `Tool` messages
+/// until an `Assistant` message is found. Returns a formatted prompt containing
+/// only these new results, suitable for a `--resume` call.
+fn tool_results_since_last_assistant(messages: &[ChatMessage]) -> String {
+    let mut results = Vec::new();
+    for msg in messages.iter().rev() {
+        match msg {
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                results.push(format!("Tool result for {tool_call_id}:\n{content}"));
+            },
+            ChatMessage::Assistant { .. } => break,
+            _ => {},
+        }
+    }
+    results.reverse();
+    if results.is_empty() {
+        "Continue.".into()
+    } else {
+        let joined = results.join("\n\n");
+        format!("{joined}\n\nContinue.")
+    }
 }
 
 /// Parse a stream-json line from Claude Code and extract a text delta.
@@ -221,36 +339,11 @@ impl LlmProvider for ClaudeCliProvider {
         messages: &[ChatMessage],
         _tools: &[serde_json::Value],
     ) -> anyhow::Result<CompletionResponse> {
-        let (extra_system, prompt) = messages_to_prompt(messages);
-
-        // Build a merged system prompt if messages contained system content.
-        let merged_system = match (&self.system_prompt, &extra_system) {
-            (Some(base), Some(extra)) => Some(format!("{base}\n\n{extra}")),
-            (Some(base), None) => Some(base.clone()),
-            (None, Some(extra)) => Some(extra.clone()),
-            (None, None) => None,
-        };
-
-        let mut args = vec![
-            "--print".into(),
-            "--output-format".into(),
-            "json".to_string(),
-            "--model".into(),
-            self.model.clone(),
-            "--no-session-persistence".into(),
-        ];
-
-        if let Some(ref sys) = merged_system {
-            args.push("--append-system-prompt".into());
-            args.push(sys.clone());
-        }
-
-        args.push(prompt.clone());
+        let (args, prompt) = self.build_session_args(messages, "json");
 
         debug!(
             model = %self.model,
             prompt_len = prompt.len(),
-            has_system = merged_system.is_some(),
             "claude-cli complete request"
         );
         trace!(prompt = %prompt, "claude-cli prompt");
@@ -267,6 +360,7 @@ impl LlmProvider for ClaudeCliProvider {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let code = output.status.code().unwrap_or(-1);
+            self.clear_session();
             anyhow::bail!("claude CLI exited with code {code}: {stderr}");
         }
 
@@ -311,28 +405,11 @@ impl LlmProvider for ClaudeCliProvider {
         _tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
         Box::pin(async_stream::stream! {
-            let (extra_system, prompt) = messages_to_prompt(&messages);
-
-            // Build a merged system prompt if messages contained system content.
-            let merged_system = match (&self.system_prompt, &extra_system) {
-                (Some(base), Some(extra)) => Some(format!("{base}\n\n{extra}")),
-                (Some(base), None) => Some(base.clone()),
-                (None, Some(extra)) => Some(extra.clone()),
-                (None, None) => None,
-            };
-
-            let provider = ClaudeCliProvider {
-                model: self.model.clone(),
-                system_prompt: merged_system,
-                claude_binary: self.claude_binary.clone(),
-            };
-
-            let args = provider.build_args(&prompt);
+            let (args, prompt) = self.build_session_args(&messages, "stream-json");
 
             debug!(
                 model = %self.model,
                 prompt_len = prompt.len(),
-                has_system = provider.system_prompt.is_some(),
                 "claude-cli stream request"
             );
             trace!(prompt = %prompt, "claude-cli stream prompt");
@@ -346,6 +423,7 @@ impl LlmProvider for ClaudeCliProvider {
             {
                 Ok(child) => child,
                 Err(e) => {
+                    self.clear_session();
                     yield StreamEvent::Error(format!("failed to spawn claude CLI: {e}"));
                     return;
                 }
@@ -354,6 +432,7 @@ impl LlmProvider for ClaudeCliProvider {
             let stdout = match child.stdout {
                 Some(stdout) => stdout,
                 None => {
+                    self.clear_session();
                     yield StreamEvent::Error("claude CLI stdout not captured".into());
                     return;
                 }
@@ -362,8 +441,7 @@ impl LlmProvider for ClaudeCliProvider {
             let reader = tokio::io::BufReader::new(stdout);
             use tokio::io::AsyncBufReadExt;
             let mut lines = reader.lines();
-
-            let mut got_done = false;
+            let mut had_delta = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim().to_string();
@@ -375,10 +453,25 @@ impl LlmProvider for ClaudeCliProvider {
 
                 if let Some(event) = parse_stream_event(&line) {
                     match &event {
-                        StreamEvent::Done(_) | StreamEvent::Error(_) => {
-                            got_done = true;
+                        StreamEvent::Error(_) => {
+                            self.clear_session();
                             yield event;
                             return;
+                        },
+                        StreamEvent::Done(_) => {
+                            yield event;
+                            return;
+                        },
+                        StreamEvent::Delta(_) => {
+                            // Claude CLI emits complete assistant messages per
+                            // event (not token-level deltas). When Claude Code
+                            // runs internal tools, multiple assistant events
+                            // arrive. Insert a separator so they don't fuse.
+                            if had_delta {
+                                yield StreamEvent::Delta("\n\n".into());
+                            }
+                            had_delta = true;
+                            yield event;
                         },
                         _ => yield event,
                     }
@@ -386,10 +479,9 @@ impl LlmProvider for ClaudeCliProvider {
             }
 
             // If we got here without a Done event, the process may have exited abnormally.
-            if !got_done {
-                warn!("claude CLI stream ended without result event");
-                yield StreamEvent::Done(Usage::default());
-            }
+            self.clear_session();
+            warn!("claude CLI stream ended without result event");
+            yield StreamEvent::Done(Usage::default());
         })
     }
 }
@@ -546,32 +638,272 @@ mod tests {
     }
 
     #[test]
-    fn build_args_basic() {
-        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
-        let args = provider.build_args("Hello");
-        assert!(args.contains(&"--print".into()));
-        assert!(args.contains(&"stream-json".into()));
-        assert!(args.contains(&"claude-sonnet-4-6".into()));
-        assert!(args.contains(&"Hello".into()));
-        assert!(!args.contains(&"--append-system-prompt".into()));
+    fn with_binary_overrides_path() {
+        let provider =
+            ClaudeCliProvider::new("claude-sonnet-4-6".into()).with_binary("/usr/local/bin/claude".into());
+        assert_eq!(provider.claude_binary, "/usr/local/bin/claude");
+    }
+
+    // ── new_content_for_resume / tool_results_since_last_assistant ─────
+
+    #[test]
+    fn extracts_tool_results_after_assistant() {
+        let messages = vec![
+            ChatMessage::user("search memory"),
+            ChatMessage::assistant_with_tools(
+                Some("Searching.".into()),
+                vec![moltis_agents::model::ToolCall {
+                    id: "call_1".into(),
+                    name: "memory_search".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            ChatMessage::tool("call_1", "result data"),
+        ];
+        let prompt = tool_results_since_last_assistant(&messages);
+        assert!(prompt.contains("Tool result for call_1:"));
+        assert!(prompt.contains("result data"));
+        assert!(prompt.ends_with("Continue."));
     }
 
     #[test]
-    fn build_args_with_system_prompt() {
+    fn extracts_multiple_tool_results() {
+        let messages = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant_with_tools(
+                None,
+                vec![
+                    moltis_agents::model::ToolCall {
+                        id: "call_1".into(),
+                        name: "tool_a".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    moltis_agents::model::ToolCall {
+                        id: "call_2".into(),
+                        name: "tool_b".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+            ),
+            ChatMessage::tool("call_1", "result A"),
+            ChatMessage::tool("call_2", "result B"),
+        ];
+        let prompt = tool_results_since_last_assistant(&messages);
+        assert!(prompt.contains("call_1"));
+        assert!(prompt.contains("result A"));
+        assert!(prompt.contains("call_2"));
+        assert!(prompt.contains("result B"));
+        // Results should be in order (call_1 before call_2).
+        let pos_a = prompt.find("call_1").unwrap();
+        let pos_b = prompt.find("call_2").unwrap();
+        assert!(pos_a < pos_b);
+    }
+
+    #[test]
+    fn returns_continue_when_no_tool_results() {
+        let messages = vec![ChatMessage::assistant("done")];
+        assert_eq!(tool_results_since_last_assistant(&messages), "Continue.");
+    }
+
+    #[test]
+    fn resume_content_for_user_message() {
+        let messages = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant("reply"),
+            ChatMessage::user("second"),
+        ];
+        assert_eq!(new_content_for_resume(&messages), "second");
+    }
+
+    #[test]
+    fn resume_content_for_tool_result() {
+        let messages = vec![
+            ChatMessage::user("search"),
+            ChatMessage::assistant_with_tools(
+                None,
+                vec![moltis_agents::model::ToolCall {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            ChatMessage::tool("c1", "found it"),
+        ];
+        let content = new_content_for_resume(&messages);
+        assert!(content.contains("c1"));
+        assert!(content.contains("found it"));
+    }
+
+    // ── build_session_args (session tracking) ─────────────────────────
+
+    #[test]
+    fn fresh_call_uses_session_id() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let messages = vec![ChatMessage::user("Hello")];
+        let (args, prompt) = provider.build_session_args(&messages, "stream-json");
+
+        assert!(args.contains(&"--session-id".into()));
+        assert!(!args.contains(&"--resume".into()));
+        assert!(!args.contains(&"--no-session-persistence".into()));
+        assert!(args.contains(&"--print".into()));
+        assert!(args.contains(&"stream-json".into()));
+        assert_eq!(prompt, "Hello");
+        // Session should now be stored.
+        assert!(provider.active_session.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn continuation_uses_resume() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        // First call: fresh session.
+        let messages_1 = vec![
+            ChatMessage::system("Be helpful."),
+            ChatMessage::user("search memory for health"),
+        ];
+        let (args_1, _) = provider.build_session_args(&messages_1, "stream-json");
+        assert!(args_1.contains(&"--session-id".into()));
+        let session_id = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Second call: continuation with tool results.
+        let messages_2 = vec![
+            ChatMessage::system("Be helpful."),
+            ChatMessage::user("search memory for health"),
+            ChatMessage::assistant_with_tools(
+                Some("Searching.".into()),
+                vec![moltis_agents::model::ToolCall {
+                    id: "call_1".into(),
+                    name: "memory_search".into(),
+                    arguments: serde_json::json!({"query": "health"}),
+                }],
+            ),
+            ChatMessage::tool("call_1", "Found 3 results about health."),
+        ];
+        let (args_2, prompt_2) = provider.build_session_args(&messages_2, "stream-json");
+
+        assert!(args_2.contains(&"--resume".into()));
+        assert!(!args_2.contains(&"--session-id".into()));
+        assert!(args_2.contains(&session_id));
+        // Prompt should contain only the tool result, not full history.
+        assert!(prompt_2.contains("call_1"));
+        assert!(prompt_2.contains("Found 3 results"));
+        assert!(!prompt_2.contains("search memory for health"));
+        // System prompt should NOT be included in resume args.
+        assert!(!args_2.contains(&"--append-system-prompt".into()));
+    }
+
+    #[test]
+    fn fresh_call_with_system_prompt() {
         let provider =
             ClaudeCliProvider::new("claude-opus-4-6".into()).with_system_prompt("Be helpful".into());
-        let args = provider.build_args("Hello");
+        let messages = vec![ChatMessage::user("Hello")];
+        let (args, _) = provider.build_session_args(&messages, "json");
+
         let sys_idx = args
             .iter()
             .position(|a| a == "--append-system-prompt")
             .unwrap();
         assert_eq!(args[sys_idx + 1], "Be helpful");
+        assert!(args.contains(&"--session-id".into()));
     }
 
     #[test]
-    fn with_binary_overrides_path() {
-        let provider =
-            ClaudeCliProvider::new("claude-sonnet-4-6".into()).with_binary("/usr/local/bin/claude".into());
-        assert_eq!(provider.claude_binary, "/usr/local/bin/claude");
+    fn clear_session_resets_state() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let messages = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages, "json");
+        assert!(provider.active_session.lock().unwrap().is_some());
+
+        provider.clear_session();
+        assert!(provider.active_session.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn no_active_session_falls_back_to_fresh() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        // Don't set up a session first — simulate edge case.
+        let messages = vec![
+            ChatMessage::user("search"),
+            ChatMessage::assistant_with_tools(
+                None,
+                vec![moltis_agents::model::ToolCall {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            ChatMessage::tool("c1", "result"),
+        ];
+        let (args, _) = provider.build_session_args(&messages, "stream-json");
+        // Should fall back to --session-id since there's no active session.
+        assert!(args.contains(&"--session-id".into()));
+        assert!(!args.contains(&"--resume".into()));
+    }
+
+    #[test]
+    fn second_user_message_resumes_session() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        // First call: fresh session.
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+        let session_id = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Second call: new user message in same conversation.
+        let messages_2 = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there!"),
+            ChatMessage::user("Follow-up question"),
+        ];
+        let (args, prompt) = provider.build_session_args(&messages_2, "json");
+
+        // Should resume, not start fresh.
+        assert!(args.contains(&"--resume".into()));
+        assert!(!args.contains(&"--session-id".into()));
+        assert!(args.contains(&session_id));
+        // Prompt should be just the new user message.
+        assert_eq!(prompt, "Follow-up question");
+    }
+
+    #[test]
+    fn cleared_session_starts_fresh() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        // First call: fresh session.
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+        let session_1 = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Simulate error → session cleared.
+        provider.clear_session();
+
+        // Next call starts fresh with a new session.
+        let messages_2 = vec![ChatMessage::user("New topic")];
+        provider.build_session_args(&messages_2, "json");
+        let session_2 = provider.active_session.lock().unwrap().clone().unwrap();
+
+        assert_ne!(session_1, session_2);
+    }
+
+    #[test]
+    fn resume_extracts_user_text_for_multimodal() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        // Set up active session.
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+
+        // Resume with multimodal user message.
+        let messages_2 = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi!"),
+            ChatMessage::user_multimodal(vec![
+                moltis_agents::model::ContentPart::Text("Describe this".into()),
+            ]),
+        ];
+        let (args, prompt) = provider.build_session_args(&messages_2, "json");
+
+        assert!(args.contains(&"--resume".into()));
+        assert_eq!(prompt, "Describe this");
     }
 }

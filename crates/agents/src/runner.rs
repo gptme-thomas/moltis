@@ -494,6 +494,20 @@ pub enum RunnerEvent {
         iterations: usize,
         tool_calls_made: usize,
     },
+    /// Tool call observed from an external agent (e.g. Claude Code subprocess).
+    /// Not executed by Moltis — for UI visibility only.
+    ObservedToolStart {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// Result of an observed tool call from an external agent.
+    ObservedToolEnd {
+        id: String,
+        name: String,
+        result: Option<String>,
+        is_error: bool,
+    },
     /// A transient LLM error occurred and the runner will retry.
     RetryingAfterError {
         error: String,
@@ -1589,6 +1603,33 @@ pub async fn run_agent_loop_streaming(
                     // Arguments are finalized after stream completes.
                     // Just log for now - we'll parse accumulated args later.
                     debug!(index, "tool call arguments complete");
+                },
+                StreamEvent::ObservedToolStart {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    if let Some(cb) = on_event {
+                        cb(RunnerEvent::ObservedToolStart {
+                            id,
+                            name,
+                            arguments,
+                        });
+                    }
+                },
+                StreamEvent::ObservedToolEnd {
+                    id,
+                    result,
+                    is_error,
+                } => {
+                    if let Some(cb) = on_event {
+                        cb(RunnerEvent::ObservedToolEnd {
+                            id,
+                            name: String::new(),
+                            result,
+                            is_error,
+                        });
+                    }
                 },
                 StreamEvent::Done(usage) => {
                     input_tokens = usage.input_tokens;

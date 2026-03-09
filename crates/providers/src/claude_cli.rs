@@ -11,13 +11,11 @@
 //! needed) and Claude Code's built-in agent capabilities. It is **not** suitable
 //! for Moltis-native tool calling since the subprocess runs its own agent loop.
 
-use std::pin::Pin;
-use std::sync::Mutex;
+use std::{pin::Pin, sync::Mutex};
 
-use {async_trait::async_trait, tokio_stream::Stream};
-use uuid::Uuid;
+use {async_trait::async_trait, tokio_stream::Stream, uuid::Uuid};
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use moltis_agents::model::{
     ChatMessage, CompletionResponse, LlmProvider, StreamEvent, Usage, UserContent,
@@ -85,9 +83,33 @@ impl ClaudeCliProvider {
             self.model.clone(),
             "--verbose".into(),
             "--dangerously-skip-permissions".into(),
+            "--disallowedTools".into(),
+            DISALLOWED_TOOLS.join(","),
         ];
 
-        // Resume existing session if we have one.
+        // Enable token-level streaming for stream-json output.
+        if output_format == "stream-json" {
+            args.push("--include-partial-messages".into());
+        }
+
+        // Detect fresh conversation: if there are no assistant messages in the
+        // history, this is a new Moltis session (e.g. after /new). Clear any
+        // stale Claude CLI session so we don't resume into old context.
+        let is_fresh_conversation = !messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Assistant { .. }));
+
+        let existing = self
+            .active_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        if is_fresh_conversation && existing.is_some() {
+            info!("claude-cli: fresh conversation detected, clearing stale session");
+            self.clear_session();
+        }
+
         let existing = self
             .active_session
             .lock()
@@ -95,12 +117,12 @@ impl ClaudeCliProvider {
             .clone();
         if let Some(sid) = existing {
             args.push("--resume".into());
-            args.push(sid);
+            args.push(sid.clone());
             let prompt = new_content_for_resume(messages);
-            debug!(
-                resume = true,
+            info!(
+                session_id = %sid,
                 prompt_len = prompt.len(),
-                "claude-cli resuming session"
+                "claude-cli: resuming session"
             );
             args.push(prompt.clone());
             return (args, prompt);
@@ -116,7 +138,7 @@ impl ClaudeCliProvider {
         *self
             .active_session
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
+            .unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
 
         // Merge system prompts from struct config and from messages.
         let merged_system = match (&self.system_prompt, &extra_system) {
@@ -126,10 +148,22 @@ impl ClaudeCliProvider {
             (None, None) => None,
         };
 
+        let merged_system = merged_system.map(|s| adapt_system_prompt_for_cli(&s));
+        let has_system_prompt = merged_system.is_some();
+        let system_prompt_len = merged_system.as_ref().map_or(0, |s| s.len());
         if let Some(sys) = merged_system {
             args.push("--append-system-prompt".into());
             args.push(sys);
         }
+
+        info!(
+            session_id = %session_id,
+            has_system_prompt,
+            system_prompt_len,
+            prompt_len = prompt.len(),
+            msg_count = messages.len(),
+            "claude-cli: starting fresh session"
+        );
 
         args.push(prompt.clone());
         (args, prompt)
@@ -214,6 +248,118 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> (Option<String>, String) {
     (system, prompt)
 }
 
+/// Concrete example appended after the Moltis tool list so the model sees a
+/// realistic call/response pair and is more likely to follow the format.
+const MOLTIS_TOOL_EXAMPLE: &str = "\
+### Example: using a Moltis tool\n\
+\n\
+User: What do you know about my health data?\n\
+Assistant: Let me search your memory for health-related information.\n\
+```tool_call\n\
+{\"tool\": \"memory_search\", \"arguments\": {\"query\": \"health\"}}\n\
+```\n\
+\n\
+*(Moltis executes the tool and returns the result in your next turn.)*\n\
+\n";
+
+/// Claude Code built-in tools that overlap with Moltis tools or are otherwise
+/// inappropriate when running inside Moltis (e.g. interactive-only tools).
+const DISALLOWED_TOOLS: &[&str] = &[
+    "Bash",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+];
+
+/// Adapt the generic Moltis system prompt for use as a Claude CLI addendum.
+///
+/// Claude CLI already has its own system prompt and built-in tools (Bash, Read,
+/// Write, etc.). The Moltis prompt is appended via `--append-system-prompt`, so
+/// we transform it to:
+/// - Remove the generic "You are a helpful assistant" intro (Claude CLI has its own)
+/// - Reframe tool descriptions as *additional* Moltis platform tools
+/// - Replace generic `tool_call` guidance with Claude-CLI-specific instructions
+///   that explain these are extra tools whose results will be returned by the runtime
+fn adapt_system_prompt_for_cli(prompt: &str) -> String {
+    let mut out = String::with_capacity(prompt.len() + 512);
+
+    // Replace the generic intro.
+    out.push_str(
+        "The following is additional context from the Moltis platform that hosts this conversation.\n\n",
+    );
+
+    let mut lines = prompt.lines().peekable();
+    let mut in_how_to_call = false;
+    let mut saw_tools_section = false;
+
+    while let Some(line) = lines.next() {
+        // Skip the generic assistant identity line.
+        if line.starts_with("You are a helpful assistant") {
+            // Also skip the blank line after it.
+            if lines.peek().is_some_and(|l| l.is_empty()) {
+                lines.next();
+            }
+            continue;
+        }
+
+        // Replace "## Available Tools" heading with Moltis-specific framing.
+        if line == "## Available Tools" {
+            saw_tools_section = true;
+            out.push_str("## Additional Moltis Tools\n\n");
+            out.push_str(
+                "In addition to your built-in Claude Code tools, the Moltis platform provides \
+                 these additional tools. To call one, output a fenced `tool_call` code block:\n\n",
+            );
+            out.push_str("```tool_call\n");
+            out.push_str("{\"tool\": \"<tool_name>\", \"arguments\": {<arguments>}}\n");
+            out.push_str("```\n\n");
+            out.push_str(
+                "The Moltis runtime will execute the tool and return the result to you in your \
+                 next turn. You can then continue your response. One tool call per block; you may \
+                 include multiple blocks.\n\n",
+            );
+            // Skip the blank line after the original heading.
+            if lines.peek().is_some_and(|l| l.is_empty()) {
+                lines.next();
+            }
+            continue;
+        }
+
+        // Skip the generic "## How to call tools" section entirely
+        // (we already included guidance above).
+        if line == "## How to call tools" {
+            in_how_to_call = true;
+            continue;
+        }
+        if in_how_to_call {
+            // End of section: next top-level heading.
+            if line.starts_with("## ") {
+                in_how_to_call = false;
+                // Fall through to emit this line normally.
+            } else {
+                continue;
+            }
+        }
+
+        // Insert a concrete example right before the Guidelines section ends
+        // the tools block, so Claude sees it immediately after the tool list.
+        if saw_tools_section && line == "## Guidelines" {
+            out.push_str(MOLTIS_TOOL_EXAMPLE);
+            saw_tools_section = false;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // If there was no Guidelines section, append the example at the end.
+    if saw_tools_section {
+        out.push_str(MOLTIS_TOOL_EXAMPLE);
+    }
+
+    out
+}
+
 /// Extract only the new content to send on a `--resume` call.
 ///
 /// - If the last message is a `Tool` result: sends tool results since the last
@@ -266,47 +412,148 @@ fn tool_results_since_last_assistant(messages: &[ChatMessage]) -> String {
     }
 }
 
-/// Parse a stream-json line from Claude Code and extract a text delta.
+/// Parse a stream-json line from Claude Code into `StreamEvent`(s).
 ///
-/// Claude Code stream-json format (NDJSON):
-/// - `{"type":"system","subtype":"init",...}` — session start
-/// - `{"type":"assistant","message":{"content":[{"type":"text","text":"..."},...]},...}` — complete message
-/// - `{"type":"result","subtype":"success","total_cost_usd":...,"duration_ms":...}` — session end
-fn parse_stream_event(line: &str) -> Option<StreamEvent> {
-    let event: serde_json::Value = serde_json::from_str(line).ok()?;
-    let event_type = event["type"].as_str()?;
+/// Returns a `Vec` because a single `assistant` snapshot may contain multiple
+/// tool_use blocks, each producing its own `ObservedToolStart` event.
+///
+/// With `--include-partial-messages`, Claude Code emits granular NDJSON events:
+///
+/// - `stream_event` → `content_block_delta` → `text_delta` — token-level text delta
+/// - `stream_event` → `content_block_delta` → `thinking_delta` — reasoning delta
+/// - `assistant` — tool_use blocks → `ObservedToolStart` events
+/// - `user` — tool_use_result → `ObservedToolEnd` events
+/// - `result` — session end with usage
+fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
+    let event: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let event_type = match event["type"].as_str() {
+        Some(t) => t,
+        None => return vec![],
+    };
 
     match event_type {
+        "stream_event" => {
+            let inner = &event["event"];
+            let inner_type = match inner["type"].as_str() {
+                Some(t) => t,
+                None => return vec![],
+            };
+
+            match inner_type {
+                "content_block_delta" => {
+                    let delta = &inner["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            match delta["text"].as_str() {
+                                Some(t) if !t.is_empty() => vec![StreamEvent::Delta(t.to_string())],
+                                _ => vec![],
+                            }
+                        },
+                        Some("thinking_delta") => {
+                            match delta["thinking"].as_str() {
+                                Some(t) if !t.is_empty() => {
+                                    vec![StreamEvent::ReasoningDelta(t.to_string())]
+                                },
+                                _ => vec![],
+                            }
+                        },
+                        _ => vec![],
+                    }
+                },
+                _ => vec![],
+            }
+        },
+        // Complete assistant snapshot — emit ObservedToolStart for each tool_use block.
         "assistant" => {
-            // Complete assistant message — extract text content.
-            let content = event["message"]["content"].as_array()?;
-            let text: String = content
+            let content = match event["message"]["content"].as_array() {
+                Some(c) => c,
+                None => return vec![],
+            };
+            content
                 .iter()
                 .filter_map(|block| {
-                    if block["type"].as_str() == Some("text") {
-                        block["text"].as_str().map(|s| s.to_string())
+                    if block["type"].as_str() == Some("tool_use") {
+                        let id = block["id"].as_str().unwrap_or("unknown").to_string();
+                        let name = block["name"].as_str().unwrap_or("unknown").to_string();
+                        let arguments = block["input"].clone();
+                        Some(StreamEvent::ObservedToolStart {
+                            id,
+                            name,
+                            arguments,
+                        })
                     } else {
                         None
                     }
                 })
-                .collect::<Vec<_>>()
-                .join("");
-            if text.is_empty() {
-                None
+                .collect()
+        },
+        // Tool result — emit ObservedToolEnd for each tool_result in the message.
+        "user" => {
+            let content = match event["message"]["content"].as_array() {
+                Some(c) => c,
+                None => return vec![],
+            };
+            // Top-level tool_use_result has the output; content[] has the IDs.
+            let top_result = &event["tool_use_result"];
+            let result_text = if let Some(s) = top_result.as_str() {
+                Some(s.to_string())
+            } else if !top_result.is_null() {
+                Some(top_result.to_string())
             } else {
-                Some(StreamEvent::Delta(text))
-            }
+                None
+            };
+            // Truncate large results for UI.
+            let result_text = result_text.map(|t| {
+                if t.len() > 2000 {
+                    format!("{}…", &t[..2000])
+                } else {
+                    t
+                }
+            });
+            content
+                .iter()
+                .filter_map(|block| {
+                    if block["type"].as_str() == Some("tool_result") {
+                        let id = block["tool_use_id"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let is_error = block["is_error"].as_bool().unwrap_or(false);
+                        Some(StreamEvent::ObservedToolEnd {
+                            id,
+                            result: result_text.clone(),
+                            is_error,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         },
         "result" => {
             let is_success = event["subtype"].as_str() == Some("success");
             if is_success {
-                Some(StreamEvent::Done(Usage::default()))
+                let usage = Usage {
+                    input_tokens: event["usage"]["input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as u32,
+                    output_tokens: event["usage"]["output_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as u32,
+                    ..Usage::default()
+                };
+                vec![StreamEvent::Done(usage)]
             } else {
                 let subtype = event["subtype"].as_str().unwrap_or("unknown");
-                Some(StreamEvent::Error(format!("Claude CLI session ended: {subtype}")))
+                vec![StreamEvent::Error(format!(
+                    "Claude CLI session ended: {subtype}"
+                ))]
             }
         },
-        _ => None,
+        _ => vec![],
     }
 }
 
@@ -374,7 +621,11 @@ impl LlmProvider for ClaudeCliProvider {
             .or_else(|| {
                 // Fallback: try raw text output.
                 let s = stdout.trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             });
 
         let cost = result["cost_usd"].as_f64().unwrap_or(0.0);
@@ -441,7 +692,6 @@ impl LlmProvider for ClaudeCliProvider {
             let reader = tokio::io::BufReader::new(stdout);
             use tokio::io::AsyncBufReadExt;
             let mut lines = reader.lines();
-            let mut had_delta = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim().to_string();
@@ -451,7 +701,7 @@ impl LlmProvider for ClaudeCliProvider {
 
                 trace!(line = %line, "claude-cli stream line");
 
-                if let Some(event) = parse_stream_event(&line) {
+                for event in parse_stream_events(&line) {
                     match &event {
                         StreamEvent::Error(_) => {
                             self.clear_session();
@@ -461,17 +711,6 @@ impl LlmProvider for ClaudeCliProvider {
                         StreamEvent::Done(_) => {
                             yield event;
                             return;
-                        },
-                        StreamEvent::Delta(_) => {
-                            // Claude CLI emits complete assistant messages per
-                            // event (not token-level deltas). When Claude Code
-                            // runs internal tools, multiple assistant events
-                            // arrive. Insert a separator so they don't fuse.
-                            if had_delta {
-                                yield StreamEvent::Delta("\n\n".into());
-                            }
-                            had_delta = true;
-                            yield event;
                         },
                         _ => yield event,
                     }
@@ -545,14 +784,13 @@ mod tests {
     fn tool_results_in_history() {
         let messages = vec![
             ChatMessage::user("Run ls"),
-            ChatMessage::assistant_with_tools(
-                Some("Let me run that.".into()),
-                vec![moltis_agents::model::ToolCall {
+            ChatMessage::assistant_with_tools(Some("Let me run that.".into()), vec![
+                moltis_agents::model::ToolCall {
                     id: "call_1".into(),
                     name: "exec".into(),
                     arguments: serde_json::json!({"cmd": "ls"}),
-                }],
-            ),
+                },
+            ]),
             ChatMessage::tool("call_1", "file.txt"),
             ChatMessage::user("What files are there?"),
         ];
@@ -571,58 +809,167 @@ mod tests {
         assert_eq!(prompt, "");
     }
 
-    // ── parse_stream_event ──────────────────────────────────────────
+    // ── parse_stream_events ─────────────────────────────────────────
 
     #[test]
-    fn parse_assistant_event() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#;
-        let event = parse_stream_event(line);
-        assert!(matches!(event, Some(StreamEvent::Delta(ref t)) if t == "Hello world"));
+    fn parse_text_delta() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::Delta(t) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_thinking_delta() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me check"}}}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "Let me check"));
+    }
+
+    #[test]
+    fn parse_observed_tool_start_from_assistant() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls -la"}}]}}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ObservedToolStart { id, name, arguments } => {
+                assert_eq!(id, "toolu_01");
+                assert_eq!(name, "Bash");
+                assert_eq!(arguments["command"], "ls -la");
+            },
+            other => panic!("expected ObservedToolStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_tool_uses_from_assistant() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"TODO"}}]}}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::ObservedToolStart { name, .. } if name == "Read"));
+        assert!(matches!(&events[1], StreamEvent::ObservedToolStart { name, .. } if name == "Grep"));
+    }
+
+    #[test]
+    fn parse_observed_tool_end_from_user() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file1.txt\nfile2.txt"}]},"tool_use_result":"file1.txt\nfile2.txt"}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ObservedToolEnd { id, result, is_error } => {
+                assert_eq!(id, "toolu_01");
+                assert!(!is_error);
+                assert!(result.as_ref().unwrap().contains("file1.txt"));
+            },
+            other => panic!("expected ObservedToolEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_observed_tool_end_error() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Permission denied"}]},"tool_use_result":"Permission denied"}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ObservedToolEnd { is_error, .. } => assert!(is_error),
+            other => panic!("expected ObservedToolEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_content_block_start_tool_ignored() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}}}"#;
+        assert!(parse_stream_events(line).is_empty());
+    }
+
+    #[test]
+    fn parse_input_json_delta_ignored() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}}"#;
+        assert!(parse_stream_events(line).is_empty());
+    }
+
+    #[test]
+    fn parse_assistant_text_only_ignored() {
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#;
+        assert!(parse_stream_events(line).is_empty());
     }
 
     #[test]
     fn parse_result_success() {
-        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.01,"duration_ms":5000,"num_turns":3}"#;
-        let event = parse_stream_event(line);
-        assert!(matches!(event, Some(StreamEvent::Done(_))));
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.01,"duration_ms":5000,"num_turns":3,"usage":{"input_tokens":100,"output_tokens":50}}"#;
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::Done(usage) => {
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+            },
+            other => panic!("expected Done, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_result_error() {
         let line = r#"{"type":"result","subtype":"error_max_budget_usd"}"#;
-        let event = parse_stream_event(line);
-        assert!(
-            matches!(event, Some(StreamEvent::Error(ref msg)) if msg.contains("error_max_budget_usd"))
-        );
+        let events = parse_stream_events(line);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::Error(msg) if msg.contains("error_max_budget_usd")));
     }
 
     #[test]
     fn parse_system_event_ignored() {
-        let line = r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-sonnet-4-6"}"#;
-        let event = parse_stream_event(line);
-        assert!(event.is_none());
+        let line =
+            r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-sonnet-4-6"}"#;
+        assert!(parse_stream_events(line).is_empty());
     }
 
     #[test]
     fn parse_invalid_json() {
-        let event = parse_stream_event("not json at all");
-        assert!(event.is_none());
+        assert!(parse_stream_events("not json at all").is_empty());
     }
 
     #[test]
-    fn parse_assistant_with_tool_use_blocks() {
-        // When Claude uses tools, the assistant message has tool_use blocks.
-        // We extract only text content and skip tool_use blocks.
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"call_1","name":"Bash","input":{"command":"ls"}}]}}"#;
-        let event = parse_stream_event(line);
-        assert!(matches!(event, Some(StreamEvent::Delta(ref t)) if t == "Let me check."));
+    fn parse_empty_text_delta_ignored() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}}"#;
+        assert!(parse_stream_events(line).is_empty());
     }
 
     #[test]
-    fn parse_assistant_empty_text() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":""}]}}"#;
-        let event = parse_stream_event(line);
-        assert!(event.is_none());
+    fn parse_message_start_ignored() {
+        let line = r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-sonnet-4-6","id":"msg_01"}}}"#;
+        assert!(parse_stream_events(line).is_empty());
+    }
+
+    #[test]
+    fn parse_content_block_start_text_ignored() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#;
+        assert!(parse_stream_events(line).is_empty());
+    }
+
+    #[test]
+    fn parse_user_no_tool_result_ignored() {
+        let line = r#"{"type":"user","message":{"content":[]},"tool_use_result":null}"#;
+        assert!(parse_stream_events(line).is_empty());
+    }
+
+    #[test]
+    fn parse_user_tool_result_truncated() {
+        let long_result = "x".repeat(3000);
+        let line = format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1"}}]}},"tool_use_result":"{long_result}"}}"#
+        );
+        let events = parse_stream_events(&line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ObservedToolEnd { result, .. } => {
+                let r = result.as_ref().unwrap();
+                assert!(r.len() <= 2010);
+                assert!(r.ends_with('…'));
+            },
+            other => panic!("expected ObservedToolEnd, got {other:?}"),
+        }
     }
 
     // ── Provider metadata ───────────────────────────────────────────
@@ -639,8 +986,8 @@ mod tests {
 
     #[test]
     fn with_binary_overrides_path() {
-        let provider =
-            ClaudeCliProvider::new("claude-sonnet-4-6".into()).with_binary("/usr/local/bin/claude".into());
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_binary("/usr/local/bin/claude".into());
         assert_eq!(provider.claude_binary, "/usr/local/bin/claude");
     }
 
@@ -650,14 +997,13 @@ mod tests {
     fn extracts_tool_results_after_assistant() {
         let messages = vec![
             ChatMessage::user("search memory"),
-            ChatMessage::assistant_with_tools(
-                Some("Searching.".into()),
-                vec![moltis_agents::model::ToolCall {
+            ChatMessage::assistant_with_tools(Some("Searching.".into()), vec![
+                moltis_agents::model::ToolCall {
                     id: "call_1".into(),
                     name: "memory_search".into(),
                     arguments: serde_json::json!({}),
-                }],
-            ),
+                },
+            ]),
             ChatMessage::tool("call_1", "result data"),
         ];
         let prompt = tool_results_since_last_assistant(&messages);
@@ -670,21 +1016,18 @@ mod tests {
     fn extracts_multiple_tool_results() {
         let messages = vec![
             ChatMessage::user("do two things"),
-            ChatMessage::assistant_with_tools(
-                None,
-                vec![
-                    moltis_agents::model::ToolCall {
-                        id: "call_1".into(),
-                        name: "tool_a".into(),
-                        arguments: serde_json::json!({}),
-                    },
-                    moltis_agents::model::ToolCall {
-                        id: "call_2".into(),
-                        name: "tool_b".into(),
-                        arguments: serde_json::json!({}),
-                    },
-                ],
-            ),
+            ChatMessage::assistant_with_tools(None, vec![
+                moltis_agents::model::ToolCall {
+                    id: "call_1".into(),
+                    name: "tool_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                moltis_agents::model::ToolCall {
+                    id: "call_2".into(),
+                    name: "tool_b".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ]),
             ChatMessage::tool("call_1", "result A"),
             ChatMessage::tool("call_2", "result B"),
         ];
@@ -719,14 +1062,11 @@ mod tests {
     fn resume_content_for_tool_result() {
         let messages = vec![
             ChatMessage::user("search"),
-            ChatMessage::assistant_with_tools(
-                None,
-                vec![moltis_agents::model::ToolCall {
-                    id: "c1".into(),
-                    name: "search".into(),
-                    arguments: serde_json::json!({}),
-                }],
-            ),
+            ChatMessage::assistant_with_tools(None, vec![moltis_agents::model::ToolCall {
+                id: "c1".into(),
+                name: "search".into(),
+                arguments: serde_json::json!({}),
+            }]),
             ChatMessage::tool("c1", "found it"),
         ];
         let content = new_content_for_resume(&messages);
@@ -747,9 +1087,19 @@ mod tests {
         assert!(!args.contains(&"--no-session-persistence".into()));
         assert!(args.contains(&"--print".into()));
         assert!(args.contains(&"stream-json".into()));
+        assert!(args.contains(&"--include-partial-messages".into()));
         assert_eq!(prompt, "Hello");
         // Session should now be stored.
         assert!(provider.active_session.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn json_format_omits_partial_messages_flag() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let messages = vec![ChatMessage::user("Hello")];
+        let (args, _) = provider.build_session_args(&messages, "json");
+
+        assert!(!args.contains(&"--include-partial-messages".into()));
     }
 
     #[test]
@@ -769,14 +1119,13 @@ mod tests {
         let messages_2 = vec![
             ChatMessage::system("Be helpful."),
             ChatMessage::user("search memory for health"),
-            ChatMessage::assistant_with_tools(
-                Some("Searching.".into()),
-                vec![moltis_agents::model::ToolCall {
+            ChatMessage::assistant_with_tools(Some("Searching.".into()), vec![
+                moltis_agents::model::ToolCall {
                     id: "call_1".into(),
                     name: "memory_search".into(),
                     arguments: serde_json::json!({"query": "health"}),
-                }],
-            ),
+                },
+            ]),
             ChatMessage::tool("call_1", "Found 3 results about health."),
         ];
         let (args_2, prompt_2) = provider.build_session_args(&messages_2, "stream-json");
@@ -794,8 +1143,8 @@ mod tests {
 
     #[test]
     fn fresh_call_with_system_prompt() {
-        let provider =
-            ClaudeCliProvider::new("claude-opus-4-6".into()).with_system_prompt("Be helpful".into());
+        let provider = ClaudeCliProvider::new("claude-opus-4-6".into())
+            .with_system_prompt("Be helpful".into());
         let messages = vec![ChatMessage::user("Hello")];
         let (args, _) = provider.build_session_args(&messages, "json");
 
@@ -803,7 +1152,10 @@ mod tests {
             .iter()
             .position(|a| a == "--append-system-prompt")
             .unwrap();
-        assert_eq!(args[sys_idx + 1], "Be helpful");
+        // The system prompt is adapted for CLI — should contain the original
+        // text wrapped in the Moltis addendum header.
+        assert!(args[sys_idx + 1].contains("Be helpful"));
+        assert!(args[sys_idx + 1].contains("Moltis platform"));
         assert!(args.contains(&"--session-id".into()));
     }
 
@@ -824,14 +1176,11 @@ mod tests {
         // Don't set up a session first — simulate edge case.
         let messages = vec![
             ChatMessage::user("search"),
-            ChatMessage::assistant_with_tools(
-                None,
-                vec![moltis_agents::model::ToolCall {
-                    id: "c1".into(),
-                    name: "search".into(),
-                    arguments: serde_json::json!({}),
-                }],
-            ),
+            ChatMessage::assistant_with_tools(None, vec![moltis_agents::model::ToolCall {
+                id: "c1".into(),
+                name: "search".into(),
+                arguments: serde_json::json!({}),
+            }]),
             ChatMessage::tool("c1", "result"),
         ];
         let (args, _) = provider.build_session_args(&messages, "stream-json");
@@ -886,6 +1235,55 @@ mod tests {
     }
 
     #[test]
+    fn fresh_conversation_clears_stale_session() {
+        // Regression: /new in Moltis should start a fresh Claude CLI session,
+        // not resume the old one. A fresh conversation has no assistant messages.
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        // First session: user asks something, gets a reply.
+        let messages_1 = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("What is Rust?"),
+        ];
+        provider.build_session_args(&messages_1, "json");
+        let session_1 = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Simulate /new: fresh conversation with no assistant messages.
+        let messages_new = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("What tools do you have?"),
+        ];
+        let (args, _) = provider.build_session_args(&messages_new, "json");
+
+        // Should NOT resume — should start a fresh session.
+        assert!(args.contains(&"--session-id".into()));
+        assert!(!args.contains(&"--resume".into()));
+        let session_2 = provider.active_session.lock().unwrap().clone().unwrap();
+        assert_ne!(session_1, session_2);
+    }
+
+    #[test]
+    fn continuation_with_assistant_still_resumes() {
+        // Verify that legitimate continuations (with assistant messages) still resume.
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        // First call.
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+        let session_id = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Second call with prior assistant message — should resume.
+        let messages_2 = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there!"),
+            ChatMessage::user("What next?"),
+        ];
+        let (args, _) = provider.build_session_args(&messages_2, "json");
+        assert!(args.contains(&"--resume".into()));
+        assert!(args.contains(&session_id));
+    }
+
+    #[test]
     fn resume_extracts_user_text_for_multimodal() {
         let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
 
@@ -897,13 +1295,190 @@ mod tests {
         let messages_2 = vec![
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi!"),
-            ChatMessage::user_multimodal(vec![
-                moltis_agents::model::ContentPart::Text("Describe this".into()),
-            ]),
+            ChatMessage::user_multimodal(vec![moltis_agents::model::ContentPart::Text(
+                "Describe this".into(),
+            )]),
         ];
         let (args, prompt) = provider.build_session_args(&messages_2, "json");
 
         assert!(args.contains(&"--resume".into()));
         assert_eq!(prompt, "Describe this");
     }
+
+    // ── adapt_system_prompt_for_cli ───────────────────────────────────
+
+    #[test]
+    fn adapt_strips_generic_intro() {
+        let input = "You are a helpful assistant. You can use tools when needed.\n\nSome context.\n";
+        let adapted = adapt_system_prompt_for_cli(input);
+        assert!(!adapted.contains("You are a helpful assistant"));
+        assert!(adapted.contains("Moltis platform"));
+        assert!(adapted.contains("Some context."));
+    }
+
+    #[test]
+    fn adapt_replaces_tools_heading() {
+        let input = "## Available Tools\n\n### memory_search\nSearch memory.\n";
+        let adapted = adapt_system_prompt_for_cli(input);
+        assert!(adapted.contains("## Additional Moltis Tools"));
+        assert!(adapted.contains("built-in Claude Code tools"));
+        assert!(adapted.contains("tool_call"));
+        // Tool schema still present.
+        assert!(adapted.contains("### memory_search"));
+    }
+
+    #[test]
+    fn adapt_removes_how_to_call_section() {
+        let input = "\
+## Available Tools\n\
+\n\
+### exec\n\
+Run commands.\n\
+\n\
+## How to call tools\n\
+\n\
+When you need to use a tool, output EXACTLY this fenced block:\n\
+\n\
+```tool_call\n\
+{\"tool\": \"exec\", \"arguments\": {\"command\": \"ls\"}}\n\
+```\n\
+\n\
+**Rules:**\n\
+- The JSON must be valid.\n\
+\n\
+## Guidelines\n\
+\n\
+Be concise.\n";
+        let adapted = adapt_system_prompt_for_cli(input);
+        // "How to call tools" section removed.
+        assert!(!adapted.contains("## How to call tools"));
+        assert!(!adapted.contains("**Rules:**"));
+        // But "Guidelines" section preserved.
+        assert!(adapted.contains("## Guidelines"));
+        assert!(adapted.contains("Be concise."));
+        // Tool schema preserved.
+        assert!(adapted.contains("### exec"));
+    }
+
+    #[test]
+    fn adapt_preserves_passthrough_content() {
+        let input = "## Runtime\n\nHost: data_dir=/home/user/.moltis\n\n## Guidelines\n\nBe helpful.\n";
+        let adapted = adapt_system_prompt_for_cli(input);
+        assert!(adapted.contains("## Runtime"));
+        assert!(adapted.contains("Host: data_dir=/home/user/.moltis"));
+        assert!(adapted.contains("## Guidelines"));
+    }
+
+    /// Dump a realistic adapted system prompt to `/tmp/claude-cli-system-prompt.txt`.
+    ///
+    /// Run with: `cargo test -p moltis-providers --features provider-claude-cli -- dump_adapted_prompt --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_adapted_prompt() {
+        let input = r#"You are a helpful assistant. You can use tools when needed.
+
+Your name is Thomas 🤖.
+Your theme: A helpful AI assistant running on a home server.
+
+## Soul
+
+You are a knowledgeable, thoughtful assistant. Be concise and direct.
+
+The user's name is Michael.
+
+## Runtime
+
+Host: data_dir=/home/thomas/.moltis, os=linux, hostname=thomas
+Sandbox(exec): enabled=false
+
+Execution routing:
+- `exec` runs inside sandbox when `Sandbox(exec): enabled=true`.
+- When sandbox is disabled, `exec` runs on the host and may require approval.
+
+## Memory
+
+You have access to a persistent memory system. Use it to store and recall important information.
+
+**Memory bootstrap (from MEMORY.md):**
+- Michael lives in Zug, Switzerland.
+- Home server hostname: thomas.
+
+## Available Tools
+
+### memory_search
+Search semantic memory for relevant stored information.
+Params: query (string, required), limit (integer)
+
+### memory_save
+Save information to persistent semantic memory.
+Params: content (string, required), tags (array)
+
+### memory_get
+Retrieve a specific memory entry by ID.
+Params: id (string, required)
+
+### exec
+Execute a shell command.
+Params: command (string, required), timeout (integer), sandbox (boolean)
+
+### speak
+Convert text to speech and send as voice message.
+Params: text (string, required), voice (string)
+
+### web_fetch
+Fetch content from a URL.
+Params: url (string, required), prompt (string)
+
+### browser
+Launch a headless browser to interact with web pages.
+Params: url (string, required), action (string)
+
+### calc
+Evaluate a mathematical expression.
+Params: expression (string, required)
+
+### send_message
+Send a message to a channel (Telegram, etc.).
+Params: text (string, required), channel (string)
+
+## How to call tools
+
+When you need to use a tool, output EXACTLY this fenced block:
+
+```tool_call
+{"tool": "<tool_name>", "arguments": {<arguments>}}
+```
+
+**Rules:**
+- The JSON must be valid. No comments, no trailing commas.
+- One tool call per fenced block. You may include multiple blocks.
+- Wait for the tool result before continuing.
+- You may include brief reasoning text before the block.
+
+**Example:**
+User: What files are in the current directory?
+Assistant: I'll list the files for you.
+```tool_call
+{"tool": "exec", "arguments": {"command": "ls -la"}}
+```
+
+## Guidelines
+
+- Start with a normal conversational response. Do not call tools for greetings, small talk, or questions you can answer directly.
+- Use the calc tool for arithmetic and expressions.
+- Use the exec tool for shell/system tasks.
+- Before tool calls, briefly state what you are about to do.
+- The UI already shows raw tool output (stdout/stderr/exit). Summarize outcomes instead.
+
+## Silent Replies
+
+When you have nothing meaningful to add after a tool call, return an empty response.
+
+The current date and time is Saturday, 2026-03-08 05:30 UTC.
+"#;
+        let adapted = adapt_system_prompt_for_cli(input);
+        std::fs::write("/tmp/claude-cli-system-prompt.txt", &adapted).unwrap();
+        println!("Wrote {} bytes to /tmp/claude-cli-system-prompt.txt", adapted.len());
+    }
+
 }

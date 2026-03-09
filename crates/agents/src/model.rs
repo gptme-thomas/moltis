@@ -345,6 +345,25 @@ pub enum StreamEvent {
         /// Index of the completed tool call.
         index: usize,
     },
+    /// Tool call observed from an external agent (e.g. Claude Code subprocess).
+    /// These are NOT for Moltis execution — just for UI visibility.
+    ObservedToolStart {
+        /// Tool call ID from the external agent.
+        id: String,
+        /// Tool name (e.g. "Bash", "Read", "Grep").
+        name: String,
+        /// Complete tool arguments.
+        arguments: serde_json::Value,
+    },
+    /// Result of an observed tool call from an external agent.
+    ObservedToolEnd {
+        /// Tool call ID (correlates with `ObservedToolStart`).
+        id: String,
+        /// Tool output (stdout, file contents, etc.), truncated if large.
+        result: Option<String>,
+        /// Whether the tool call failed.
+        is_error: bool,
+    },
     /// Stream completed successfully.
     Done(Usage),
     /// An error occurred.

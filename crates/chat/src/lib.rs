@@ -4529,6 +4529,8 @@ impl ChatService for LiveChatService {
                 StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgumentsDelta { .. }
                 | StreamEvent::ToolCallComplete { .. }
+                | StreamEvent::ObservedToolStart { .. }
+                | StreamEvent::ObservedToolEnd { .. }
                 // Provider raw payloads are debug metadata, not summary text.
                 | StreamEvent::ProviderRaw(_)
                 // Ignore provider reasoning blocks; summary body should only
@@ -6679,6 +6681,57 @@ async fn run_with_tools(
                     ),
                     "seq": seq,
                 }),
+                RunnerEvent::ObservedToolStart {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    // Notify channels (Telegram, etc.) about observed tool use.
+                    let state_clone = Arc::clone(&state);
+                    let sk_clone = sk.clone();
+                    let name_clone = name.clone();
+                    let args_clone = arguments.clone();
+                    tokio::spawn(async move {
+                        send_tool_status_to_channels(
+                            &state_clone,
+                            &sk_clone,
+                            &name_clone,
+                            &args_clone,
+                        )
+                        .await;
+                    });
+
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "tool_call_start",
+                        "toolCallId": id,
+                        "toolName": name,
+                        "arguments": arguments,
+                        "seq": seq,
+                    })
+                },
+                RunnerEvent::ObservedToolEnd {
+                    id,
+                    name,
+                    result,
+                    is_error,
+                } => {
+                    let result_val = result.map(|r| {
+                        serde_json::json!({ "stdout": r, "stderr": "", "exit_code": 0 })
+                    });
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "tool_call_end",
+                        "toolCallId": id,
+                        "toolName": name,
+                        "success": !is_error,
+                        "error": if is_error { result_val.clone() } else { None::<Value> },
+                        "result": if is_error { None::<Value> } else { result_val },
+                        "seq": seq,
+                    })
+                },
                 RunnerEvent::RetryingAfterError { error, delay_ms } => {
                     let error_obj =
                         parse_chat_error(&error, Some(provider_name_for_events.as_str()));
@@ -7076,6 +7129,8 @@ async fn compact_session(
             StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallArgumentsDelta { .. }
             | StreamEvent::ToolCallComplete { .. }
+            | StreamEvent::ObservedToolStart { .. }
+            | StreamEvent::ObservedToolEnd { .. }
             // Provider raw payloads are debug metadata, not summary text.
             | StreamEvent::ProviderRaw(_)
             // Ignore provider reasoning blocks; summary body should only
@@ -7565,7 +7620,9 @@ async fn run_streaming(
                 // Tool events not expected in stream-only mode.
                 StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. } => {},
+                | StreamEvent::ToolCallComplete { .. }
+                | StreamEvent::ObservedToolStart { .. }
+                | StreamEvent::ObservedToolEnd { .. } => {},
             }
         }
 
@@ -9368,6 +9425,7 @@ mod tests {
             parent_session_key: None,
             fork_point: None,
             mcp_disabled: None,
+            approval_mode: None,
             preview: None,
             agent_id: None,
             node_id: None,

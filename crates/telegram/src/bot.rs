@@ -58,6 +58,7 @@ pub async fn start_polling(
         BotCommand::new("agent", "Switch session agent"),
         BotCommand::new("model", "Switch provider/model"),
         BotCommand::new("sandbox", "Toggle sandbox and choose image"),
+        BotCommand::new("approval", "Set exec approval mode"),
         BotCommand::new("sh", "Enable shell command mode"),
         BotCommand::new("clear", "Clear session history"),
         BotCommand::new("compact", "Compact session (summarize)"),

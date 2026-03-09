@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use {
     async_trait::async_trait,
-    moltis_tools::image_cache::ImageBuilder,
+    moltis_tools::{approval::ApprovalMode, image_cache::ImageBuilder},
     tracing::{debug, error, info, warn},
 };
 
@@ -76,6 +76,7 @@ fn is_channel_control_command_name(cmd: &str) -> bool {
             | "context"
             | "model"
             | "sandbox"
+            | "approval"
             | "sessions"
             | "agent"
             | "help"
@@ -1622,6 +1623,102 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     ))
                 }
             },
+            "approval" => {
+                if args.is_empty() {
+                    let override_mode = session_metadata
+                        .get(&session_key)
+                        .await
+                        .and_then(|entry| entry.approval_mode);
+                    let global_mode = state
+                        .services
+                        .exec_approval
+                        .get()
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("mode")
+                                .and_then(|mode| mode.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let effective_mode =
+                        override_mode.clone().unwrap_or_else(|| global_mode.clone());
+                    let override_line = override_mode
+                        .map(|mode| format!("override:{mode}"))
+                        .unwrap_or_else(|| "override:default".to_string());
+                    Ok(format!(
+                        "{override_line}\neffective:{effective_mode}\nglobal:{global_mode}"
+                    ))
+                } else if args == "clear" {
+                    let patch_res = state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "approval_mode": serde_json::Value::Null,
+                        }))
+                        .await
+                        .map_err(ChannelError::unavailable)?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    broadcast(
+                        state,
+                        "session",
+                        serde_json::json!({
+                            "kind": "patched",
+                            "sessionKey": &session_key,
+                            "version": version,
+                        }),
+                        BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    Ok("Approval mode override cleared.".to_string())
+                } else if let Some(parsed) = ApprovalMode::parse(args) {
+                    let canonical = match parsed {
+                        ApprovalMode::Off => "off",
+                        ApprovalMode::OnMiss => "on-miss",
+                        ApprovalMode::Always => "always",
+                    };
+                    let patch_res = state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "approval_mode": canonical,
+                        }))
+                        .await
+                        .map_err(ChannelError::unavailable)?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    broadcast(
+                        state,
+                        "session",
+                        serde_json::json!({
+                            "kind": "patched",
+                            "sessionKey": &session_key,
+                            "version": version,
+                        }),
+                        BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    Ok(format!("Approval mode set to: {canonical}."))
+                } else {
+                    Err(ChannelError::invalid_input(
+                        "usage: /approval [off|on-miss|always|clear]",
+                    ))
+                }
+            },
             "sh" => {
                 let route = if let Some(ref router) = state.sandbox_router {
                     if router.is_sandboxed(&session_key).await {
@@ -1845,11 +1942,13 @@ mod tests {
     fn peek_and_stop_are_control_commands() {
         assert!(is_channel_control_command_name("peek"));
         assert!(is_channel_control_command_name("stop"));
+        assert!(is_channel_control_command_name("approval"));
     }
 
     #[test]
     fn shell_mode_rewrite_skips_peek_and_stop() {
         assert!(rewrite_for_shell_mode("/peek").is_none());
         assert!(rewrite_for_shell_mode("/stop").is_none());
+        assert!(rewrite_for_shell_mode("/approval off").is_none());
     }
 }

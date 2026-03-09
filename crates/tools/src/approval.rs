@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use {
     crate::error::Error,
@@ -248,8 +252,9 @@ pub struct ApprovalManager {
     pub security_level: SecurityLevel,
     pub allowlist: Vec<String>,
     pub timeout: Duration,
-    pending: Arc<RwLock<std::collections::HashMap<String, PendingApproval>>>,
+    pending: Arc<RwLock<HashMap<String, PendingApproval>>>,
     approved_commands: Arc<RwLock<HashSet<String>>>,
+    mode_overrides: Arc<RwLock<HashMap<String, ApprovalMode>>>,
 }
 
 impl Default for ApprovalManager {
@@ -259,16 +264,50 @@ impl Default for ApprovalManager {
             security_level: SecurityLevel::Allowlist,
             allowlist: Vec::new(),
             timeout: Duration::from_secs(120),
-            pending: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending: Arc::new(RwLock::new(HashMap::new())),
             approved_commands: Arc::new(RwLock::new(HashSet::new())),
+            mode_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
 impl ApprovalManager {
+    /// Set a per-session approval mode override.
+    pub async fn set_mode_override(&self, session_key: &str, mode: ApprovalMode) {
+        self.mode_overrides
+            .write()
+            .await
+            .insert(session_key.to_string(), mode);
+    }
+
+    /// Remove a per-session approval mode override.
+    pub async fn remove_mode_override(&self, session_key: &str) {
+        self.mode_overrides.write().await.remove(session_key);
+    }
+
+    /// Resolve the effective approval mode for a session.
+    pub async fn effective_mode(&self, session_key: Option<&str>) -> ApprovalMode {
+        if let Some(key) = session_key
+            && let Some(mode) = self.mode_overrides.read().await.get(key)
+        {
+            return mode.clone();
+        }
+        self.mode.clone()
+    }
+
     /// Decide whether a command needs approval.
     /// Returns Ok(()) if the command can proceed, Err if denied.
     pub async fn check_command(&self, command: &str) -> Result<ApprovalAction> {
+        self.check_command_for_session(command, None).await
+    }
+
+    /// Decide whether a command needs approval for a given session.
+    /// Returns Ok(()) if the command can proceed, Err if denied.
+    pub async fn check_command_for_session(
+        &self,
+        command: &str,
+        session_key: Option<&str>,
+    ) -> Result<ApprovalAction> {
         // Safety floor: dangerous patterns force approval regardless of mode.
         if let Some(desc) = check_dangerous(command) {
             if !matches_allowlist(command, &self.allowlist) {
@@ -286,7 +325,7 @@ impl ApprovalManager {
             SecurityLevel::Allowlist => {},
         }
 
-        match self.mode {
+        match self.effective_mode(session_key).await {
             ApprovalMode::Off => Ok(ApprovalAction::Proceed),
             ApprovalMode::Always => Ok(ApprovalAction::NeedsApproval),
             ApprovalMode::OnMiss => {
@@ -466,6 +505,54 @@ mod tests {
             ..Default::default()
         };
         assert!(mgr.check_command("echo hi").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_session_override_off_bypasses_non_dangerous_approval() {
+        let mgr = ApprovalManager::default();
+        mgr.set_mode_override("telegram:acct:123", ApprovalMode::Off)
+            .await;
+
+        let action = mgr
+            .check_command_for_session("curl https://example.com", Some("telegram:acct:123"))
+            .await
+            .unwrap();
+        assert_eq!(action, ApprovalAction::Proceed);
+    }
+
+    #[tokio::test]
+    async fn test_session_override_does_not_bypass_dangerous_patterns() {
+        let mgr = ApprovalManager::default();
+        mgr.set_mode_override("telegram:acct:123", ApprovalMode::Off)
+            .await;
+
+        let action = mgr
+            .check_command_for_session("rm -rf /", Some("telegram:acct:123"))
+            .await
+            .unwrap();
+        assert_eq!(action, ApprovalAction::NeedsApproval);
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_override_reverts_to_global_mode() {
+        let mgr = ApprovalManager {
+            mode: ApprovalMode::Always,
+            ..Default::default()
+        };
+        mgr.set_mode_override("telegram:acct:123", ApprovalMode::Off)
+            .await;
+        let action = mgr
+            .check_command_for_session("curl https://example.com", Some("telegram:acct:123"))
+            .await
+            .unwrap();
+        assert_eq!(action, ApprovalAction::Proceed);
+
+        mgr.remove_mode_override("telegram:acct:123").await;
+        let action = mgr
+            .check_command_for_session("echo hi", Some("telegram:acct:123"))
+            .await
+            .unwrap();
+        assert_eq!(action, ApprovalAction::NeedsApproval);
     }
 
     // --- Dangerous pattern detection ---

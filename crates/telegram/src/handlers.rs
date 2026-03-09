@@ -729,7 +729,7 @@ pub async fn handle_message_direct(
                 }
 
                 let response = if cmd == "help" {
-                    "Available commands:\n/new — Start a new session\n/sessions — List and switch sessions\n/agent — Switch session agent\n/model — Switch provider/model\n/sandbox — Toggle sandbox and choose image\n/sh — Enable command mode (/sh off to exit)\n/clear — Clear session history\n/compact — Compact session (summarize)\n/context — Show session context info\n/help — Show this help".to_string()
+                    "Available commands:\n/new — Start a new session\n/sessions — List and switch sessions\n/agent — Switch session agent\n/model — Switch provider/model\n/sandbox — Toggle sandbox and choose image\n/approval — Show or set exec approval mode\n/sh — Enable command mode (/sh off to exit)\n/clear — Clear session history\n/compact — Compact session (summarize)\n/context — Show session context info\n/help — Show this help".to_string()
                 } else {
                     match sink.dispatch_command(cmd_text, reply_target.clone()).await {
                         Ok(msg) => msg,
@@ -786,7 +786,15 @@ pub async fn handle_message_direct(
 
 fn should_intercept_slash_command(cmd: &str, cmd_text: &str) -> bool {
     match cmd {
-        "new" | "clear" | "compact" | "context" | "model" | "sandbox" | "sessions" | "agent"
+        "new"
+        | "clear"
+        | "compact"
+        | "context"
+        | "model"
+        | "sandbox"
+        | "approval"
+        | "sessions"
+        | "agent"
         | "help" => true,
         "sh" => {
             let args = cmd_text.strip_prefix(cmd).unwrap_or("").trim();
@@ -2166,6 +2174,15 @@ mod tests {
         assert!(should_intercept_slash_command("sh", "sh off"));
         assert!(should_intercept_slash_command("sh", "sh exit"));
         assert!(should_intercept_slash_command("sh", "sh status"));
+    }
+
+    #[test]
+    fn approval_command_is_intercepted() {
+        assert!(should_intercept_slash_command("approval", "approval"));
+        assert!(should_intercept_slash_command("approval", "approval off"));
+        assert!(should_intercept_slash_command("approval", "approval on-miss"));
+        assert!(should_intercept_slash_command("approval", "approval always"));
+        assert!(should_intercept_slash_command("approval", "approval clear"));
     }
 
     #[test]

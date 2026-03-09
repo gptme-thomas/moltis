@@ -15,7 +15,10 @@ use {
         message::PersistedMessage, metadata::SqliteSessionMetadata, state_store::SessionStateStore,
         store::SessionStore,
     },
-    moltis_tools::sandbox::SandboxRouter,
+    moltis_tools::{
+        approval::{ApprovalManager, ApprovalMode},
+        sandbox::SandboxRouter,
+    },
 };
 
 use crate::{
@@ -124,6 +127,14 @@ fn sanitize_tts_text(text: &str) -> String {
     #[cfg(not(feature = "voice"))]
     {
         text.to_string()
+    }
+}
+
+fn approval_mode_name(mode: &ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Off => "off",
+        ApprovalMode::OnMiss => "on-miss",
+        ApprovalMode::Always => "always",
     }
 }
 
@@ -806,6 +817,7 @@ pub struct LiveSessionService {
     tts_service: Option<Arc<dyn TtsService>>,
     share_store: Option<Arc<ShareStore>>,
     sandbox_router: Option<Arc<SandboxRouter>>,
+    approval_manager: Option<Arc<ApprovalManager>>,
     project_store: Option<Arc<dyn ProjectStore>>,
     hook_registry: Option<Arc<HookRegistry>>,
     state_store: Option<Arc<SessionStateStore>>,
@@ -821,6 +833,7 @@ impl LiveSessionService {
             tts_service: None,
             share_store: None,
             sandbox_router: None,
+            approval_manager: None,
             project_store: None,
             hook_registry: None,
             state_store: None,
@@ -830,6 +843,11 @@ impl LiveSessionService {
 
     pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
         self.sandbox_router = Some(router);
+        self
+    }
+
+    pub fn with_approval_manager(mut self, manager: Arc<ApprovalManager>) -> Self {
+        self.approval_manager = Some(manager);
         self
     }
 
@@ -1036,6 +1054,8 @@ impl SessionService for LiveSessionService {
                 "parentSessionKey": e.parent_session_key,
                 "forkPoint": e.fork_point,
                 "mcpDisabled": e.mcp_disabled,
+                "approval_mode": e.approval_mode,
+                "approvalMode": e.approval_mode,
                 "preview": preview,
                 "agent_id": agent_id,
                 "agentId": agent_id,
@@ -1161,6 +1181,8 @@ impl SessionService for LiveSessionService {
                 "sandbox_image": entry.sandbox_image,
                 "worktree_branch": entry.worktree_branch,
                 "mcpDisabled": entry.mcp_disabled,
+                "approval_mode": entry.approval_mode,
+                "approvalMode": entry.approval_mode,
                 "agent_id": entry.agent_id,
                 "agentId": entry.agent_id,
                 "node_id": entry.node_id,
@@ -1213,6 +1235,56 @@ impl SessionService for LiveSessionService {
         if let Some(mcp_disabled) = p.mcp_disabled {
             self.metadata.set_mcp_disabled(key, mcp_disabled).await;
         }
+        if let Some(approval_mode_opt) = p.approval_mode {
+            let old_approval_mode = entry.approval_mode.clone();
+            let normalized_mode = match approval_mode_opt {
+                Some(raw) => {
+                    let parsed = ApprovalMode::parse(&raw).ok_or_else(|| {
+                        format!("invalid approval mode '{raw}' (expected off, on-miss, always)")
+                    })?;
+                    Some(approval_mode_name(&parsed).to_string())
+                },
+                None => None,
+            };
+            self.metadata
+                .set_approval_mode(key, normalized_mode.clone())
+                .await;
+            if let Some(ref mgr) = self.approval_manager {
+                if let Some(ref mode_name) = normalized_mode {
+                    let parsed = ApprovalMode::parse(mode_name)
+                        .ok_or_else(|| format!("invalid normalized approval mode '{mode_name}'"))?;
+                    mgr.set_mode_override(key, parsed).await;
+                } else {
+                    mgr.remove_mode_override(key).await;
+                }
+            }
+            if old_approval_mode != normalized_mode {
+                let notification = if let Some(ref mode_name) = normalized_mode {
+                    match mode_name.as_str() {
+                        "off" => {
+                            "Exec approval mode for this session has been set to `off`. \
+                             Non-dangerous host `exec` commands will run without interactive approval. \
+                             Dangerous commands may still require approval unless explicitly allowlisted."
+                        },
+                        "always" => {
+                            "Exec approval mode for this session has been set to `always`. \
+                             Host `exec` commands will require approval before running."
+                        },
+                        _ => {
+                            "Exec approval mode for this session has been set to `on-miss`. \
+                             Host `exec` commands outside the safe list will require approval."
+                        },
+                    }
+                } else {
+                    "Exec approval mode override has been cleared for this session. \
+                     Host `exec` will use the global approval policy."
+                };
+                let msg = PersistedMessage::system(notification);
+                if let Err(e) = self.store.append_typed(key, &msg).await {
+                    warn!(session = key, error = %e, "failed to append approval mode notification");
+                }
+            }
+        }
         if let Some(sandbox_enabled_opt) = p.sandbox_enabled {
             let old_sandbox = entry.sandbox_enabled;
             self.metadata
@@ -1261,6 +1333,8 @@ impl SessionService for LiveSessionService {
             "sandbox_image": entry.sandbox_image,
             "worktree_branch": entry.worktree_branch,
             "mcpDisabled": entry.mcp_disabled,
+            "approval_mode": entry.approval_mode,
+            "approvalMode": entry.approval_mode,
             "agent_id": entry.agent_id,
             "agentId": entry.agent_id,
             "node_id": entry.node_id,
@@ -2856,5 +2930,104 @@ mod tests {
             content.contains("cleared"),
             "notification should mention cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_approval_mode_appends_notification_and_syncs_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        let approval_manager = Arc::new(ApprovalManager::default());
+        metadata
+            .upsert("main", Some("Test".to_string()))
+            .await
+            .unwrap();
+
+        let svc = LiveSessionService::new(Arc::clone(&store), Arc::clone(&metadata))
+            .with_approval_manager(Arc::clone(&approval_manager));
+
+        let result = svc
+            .patch(serde_json::json!({ "key": "main", "approvalMode": "off" }))
+            .await
+            .unwrap();
+        assert_eq!(result["approvalMode"], "off");
+        assert_eq!(
+            metadata.get("main").await.unwrap().approval_mode.as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            approval_manager.effective_mode(Some("main")).await,
+            ApprovalMode::Off
+        );
+
+        let msgs = store.read("main").await.unwrap();
+        assert_eq!(msgs.len(), 1, "should have one system notification");
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("set to `off`"),
+            "notification should mention the new mode"
+        );
+
+        svc.patch(serde_json::json!({ "key": "main", "approvalMode": null }))
+            .await
+            .unwrap();
+        assert_eq!(
+            approval_manager.effective_mode(Some("main")).await,
+            ApprovalMode::OnMiss
+        );
+        let msgs = store.read("main").await.unwrap();
+        assert_eq!(msgs.len(), 2, "clearing should append notification");
+        let content = msgs[1]["content"].as_str().unwrap();
+        assert!(
+            content.contains("cleared"),
+            "clear notification should mention cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_approval_mode_no_change_skips_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        let approval_manager = Arc::new(ApprovalManager::default());
+        metadata
+            .upsert("main", Some("Test".to_string()))
+            .await
+            .unwrap();
+
+        let svc = LiveSessionService::new(Arc::clone(&store), Arc::clone(&metadata))
+            .with_approval_manager(Arc::clone(&approval_manager));
+
+        svc.patch(serde_json::json!({ "key": "main", "approvalMode": "always" }))
+            .await
+            .unwrap();
+        svc.patch(serde_json::json!({ "key": "main", "approvalMode": "always" }))
+            .await
+            .unwrap();
+
+        let msgs = store.read("main").await.unwrap();
+        assert_eq!(msgs.len(), 1, "no duplicate notification for same mode");
+    }
+
+    #[tokio::test]
+    async fn patch_approval_mode_rejects_invalid_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        metadata
+            .upsert("main", Some("Test".to_string()))
+            .await
+            .unwrap();
+
+        let svc = LiveSessionService::new(store, Arc::clone(&metadata));
+        let err = svc
+            .patch(serde_json::json!({ "key": "main", "approvalMode": "bogus" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid approval mode"));
+        assert!(metadata.get("main").await.unwrap().approval_mode.is_none());
     }
 }

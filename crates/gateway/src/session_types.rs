@@ -34,6 +34,8 @@ pub struct PatchParams {
     pub mcp_disabled: Option<Option<bool>>,
     #[serde(default, deserialize_with = "double_option", alias = "sandbox_enabled")]
     pub sandbox_enabled: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option", alias = "approval_mode")]
+    pub approval_mode: Option<Option<String>>,
 }
 
 /// Deserialize a field as `Some(inner)` when present (even if null),
@@ -105,6 +107,7 @@ mod tests {
         assert!(p.model.is_none());
         assert!(p.project_id.is_none());
         assert!(p.sandbox_enabled.is_none());
+        assert!(p.approval_mode.is_none());
     }
 
     #[test]
@@ -121,6 +124,7 @@ mod tests {
         assert_eq!(p.model.as_deref(), Some("gpt-4o"));
         assert_eq!(p.sandbox_enabled, Some(Some(true)));
         assert_eq!(p.mcp_disabled, Some(Some(false)));
+        assert!(p.approval_mode.is_none());
     }
 
     #[test]
@@ -152,6 +156,7 @@ mod tests {
             "sandbox_image": "custom:latest",
             "sandbox_enabled": false,
             "mcp_disabled": true,
+            "approval_mode": "always",
         }))
         .unwrap();
         assert_eq!(p.project_id, Some(Some("proj-1".to_string())));
@@ -159,6 +164,27 @@ mod tests {
         assert_eq!(p.sandbox_image, Some(Some("custom:latest".to_string())));
         assert_eq!(p.sandbox_enabled, Some(Some(false)));
         assert_eq!(p.mcp_disabled, Some(Some(true)));
+        assert_eq!(p.approval_mode, Some(Some("always".to_string())));
+    }
+
+    #[test]
+    fn patch_params_approval_mode_camel_case() {
+        let p: PatchParams = serde_json::from_value(json!({
+            "key": "main",
+            "approvalMode": "on-miss",
+        }))
+        .unwrap();
+        assert_eq!(p.approval_mode, Some(Some("on-miss".to_string())));
+    }
+
+    #[test]
+    fn patch_params_approval_mode_null_clears() {
+        let p: PatchParams = serde_json::from_value(json!({
+            "key": "main",
+            "approvalMode": null,
+        }))
+        .unwrap();
+        assert_eq!(p.approval_mode, Some(None));
     }
 
     #[test]

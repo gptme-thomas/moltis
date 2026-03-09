@@ -2596,6 +2596,17 @@ pub async fn prepare_gateway_core(
                     .set_image_override(&entry.key, image.clone())
                     .await;
             }
+            if let Some(ref approval_mode) = entry.approval_mode {
+                if let Some(parsed) = ApprovalMode::parse(approval_mode) {
+                    approval_manager.set_mode_override(&entry.key, parsed).await;
+                } else {
+                    warn!(
+                        session = %entry.key,
+                        value = %approval_mode,
+                        "invalid persisted approval mode; ignoring session override"
+                    );
+                }
+            }
         }
     }
 
@@ -2854,6 +2865,7 @@ pub async fn prepare_gateway_core(
                 .with_tts_service(Arc::clone(&services.tts))
                 .with_share_store(Arc::clone(&session_share_store))
                 .with_sandbox_router(Arc::clone(&sandbox_router))
+                .with_approval_manager(Arc::clone(&approval_manager))
                 .with_agent_persona_store(Arc::clone(&agent_persona_store))
                 .with_project_store(Arc::clone(&project_store))
                 .with_state_store(Arc::clone(&session_state_store))

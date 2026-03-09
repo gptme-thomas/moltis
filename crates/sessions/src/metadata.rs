@@ -42,6 +42,8 @@ pub struct SessionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -134,6 +136,7 @@ impl SessionMetadata {
                 parent_session_key: None,
                 fork_point: None,
                 mcp_disabled: None,
+                approval_mode: None,
                 preview: None,
                 agent_id: None,
                 node_id: None,
@@ -199,6 +202,15 @@ impl SessionMetadata {
     pub fn set_mcp_disabled(&mut self, key: &str, disabled: Option<bool>) {
         if let Some(entry) = self.entries.get_mut(key) {
             entry.mcp_disabled = disabled;
+            entry.updated_at = now_ms();
+            entry.version += 1;
+        }
+    }
+
+    /// Set the approval_mode override for a session.
+    pub fn set_approval_mode(&mut self, key: &str, mode: Option<String>) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.approval_mode = mode;
             entry.updated_at = now_ms();
             entry.version += 1;
         }
@@ -300,6 +312,7 @@ struct SessionRow {
     parent_session_key: Option<String>,
     fork_point: Option<i32>,
     mcp_disabled: Option<i32>,
+    approval_mode: Option<String>,
     preview: Option<String>,
     agent_id: Option<String>,
     node_id: Option<String>,
@@ -326,6 +339,7 @@ impl From<SessionRow> for SessionEntry {
             parent_session_key: r.parent_session_key,
             fork_point: r.fork_point.map(|v| v as u32),
             mcp_disabled: r.mcp_disabled.map(|v| v != 0),
+            approval_mode: r.approval_mode,
             preview: r.preview,
             agent_id: r.agent_id,
             node_id: r.node_id,
@@ -390,6 +404,7 @@ impl SqliteSessionMetadata {
                 parent_session_key  TEXT,
                 fork_point          INTEGER,
                 mcp_disabled        INTEGER,
+                approval_mode       TEXT,
                 preview             TEXT,
                 agent_id            TEXT,
                 node_id             TEXT,
@@ -628,6 +643,22 @@ impl SqliteSessionMetadata {
             "UPDATE sessions SET mcp_disabled = ?, updated_at = ?, version = version + 1 WHERE key = ?",
         )
         .bind(val)
+        .bind(now)
+        .bind(key)
+            .execute(&self.pool)
+            .await
+            .ok();
+        self.emit(crate::session_events::SessionEvent::Patched {
+            session_key: key.to_string(),
+        });
+    }
+
+    pub async fn set_approval_mode(&self, key: &str, mode: Option<String>) {
+        let now = now_ms() as i64;
+        sqlx::query(
+            "UPDATE sessions SET approval_mode = ?, updated_at = ?, version = version + 1 WHERE key = ?",
+        )
+        .bind(&mode)
         .bind(now)
         .bind(key)
             .execute(&self.pool)
@@ -1428,6 +1459,39 @@ mod tests {
         assert_eq!(reloaded.get("main").unwrap().mcp_disabled, Some(true));
     }
 
+    #[test]
+    fn test_approval_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.json");
+        let mut meta = SessionMetadata::load(path.clone()).unwrap();
+
+        meta.upsert("main", None);
+        assert!(meta.get("main").unwrap().approval_mode.is_none());
+
+        meta.set_approval_mode("main", Some("off".to_string()));
+        assert_eq!(
+            meta.get("main").unwrap().approval_mode.as_deref(),
+            Some("off")
+        );
+
+        meta.set_approval_mode("main", Some("always".to_string()));
+        assert_eq!(
+            meta.get("main").unwrap().approval_mode.as_deref(),
+            Some("always")
+        );
+
+        meta.set_approval_mode("main", None);
+        assert!(meta.get("main").unwrap().approval_mode.is_none());
+
+        meta.set_approval_mode("main", Some("on-miss".to_string()));
+        meta.save().unwrap();
+        let reloaded = SessionMetadata::load(path).unwrap();
+        assert_eq!(
+            reloaded.get("main").unwrap().approval_mode.as_deref(),
+            Some("on-miss")
+        );
+    }
+
     #[tokio::test]
     async fn test_sqlite_mcp_disabled() {
         let pool = sqlite_pool().await;
@@ -1444,6 +1508,32 @@ mod tests {
 
         meta.set_mcp_disabled("main", None).await;
         assert!(meta.get("main").await.unwrap().mcp_disabled.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_approval_mode() {
+        let pool = sqlite_pool().await;
+        let meta = SqliteSessionMetadata::new(pool);
+
+        meta.upsert("main", None).await.unwrap();
+        assert!(meta.get("main").await.unwrap().approval_mode.is_none());
+
+        meta.set_approval_mode("main", Some("off".to_string()))
+            .await;
+        assert_eq!(
+            meta.get("main").await.unwrap().approval_mode.as_deref(),
+            Some("off")
+        );
+
+        meta.set_approval_mode("main", Some("always".to_string()))
+            .await;
+        assert_eq!(
+            meta.get("main").await.unwrap().approval_mode.as_deref(),
+            Some("always")
+        );
+
+        meta.set_approval_mode("main", None).await;
+        assert!(meta.get("main").await.unwrap().approval_mode.is_none());
     }
 
     #[tokio::test]
@@ -1491,22 +1581,26 @@ mod tests {
         meta.set_mcp_disabled("main", Some(true)).await;
         assert_eq!(meta.get("main").await.unwrap().version, 7);
 
-        meta.set_channel_binding("main", Some("{}".to_string()))
+        meta.set_approval_mode("main", Some("off".to_string()))
             .await;
         assert_eq!(meta.get("main").await.unwrap().version, 8);
 
-        meta.set_parent("main", Some("parent".to_string()), Some(0))
+        meta.set_channel_binding("main", Some("{}".to_string()))
             .await;
         assert_eq!(meta.get("main").await.unwrap().version, 9);
 
-        meta.mark_seen("main").await;
+        meta.set_parent("main", Some("parent".to_string()), Some(0))
+            .await;
         assert_eq!(meta.get("main").await.unwrap().version, 10);
 
-        meta.set_preview("main", Some("hello")).await;
+        meta.mark_seen("main").await;
         assert_eq!(meta.get("main").await.unwrap().version, 11);
 
-        meta.set_agent_id("main", Some("agent-1")).await.unwrap();
+        meta.set_preview("main", Some("hello")).await;
         assert_eq!(meta.get("main").await.unwrap().version, 12);
+
+        meta.set_agent_id("main", Some("agent-1")).await.unwrap();
+        assert_eq!(meta.get("main").await.unwrap().version, 13);
     }
 
     #[tokio::test]

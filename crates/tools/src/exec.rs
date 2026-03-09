@@ -535,7 +535,7 @@ impl AgentTool for ExecTool {
 
         // Approval gating.
         if !is_sandboxed && let Some(ref mgr) = self.approval_manager {
-            let action = mgr.check_command(command).await?;
+            let action = mgr.check_command_for_session(command, session_key).await?;
             if action == ApprovalAction::NeedsApproval {
                 info!(command, "command needs approval, waiting...");
                 let (req_id, rx) = mgr.create_request(command).await;
@@ -933,6 +933,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "safe");
+        assert!(!bc.called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_session_override_bypasses_approval() {
+        let mgr = Arc::new(ApprovalManager::default());
+        mgr.set_mode_override("telegram:acct:123", crate::approval::ApprovalMode::Off)
+            .await;
+        let bc = Arc::new(TestBroadcaster::new());
+        let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut tool = ExecTool::default().with_approval(Arc::clone(&mgr), bc_dyn);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "sh -lc 'printf unsafe'",
+                "_session_key": "telegram:acct:123",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap_or_default(), "unsafe");
         assert!(!bc.called.load(Ordering::SeqCst));
     }
 

@@ -2438,6 +2438,21 @@ pub struct ProviderEntry {
     /// providers with automatic server-side caching (OpenAI, DeepSeek, Ollama).
     #[serde(default, skip_serializing_if = "is_default_cache_retention")]
     pub cache_retention: CacheRetention,
+
+    /// Working directory for subprocess-based providers (e.g. `claude-cli`).
+    ///
+    /// When set, the spawned process starts in this directory instead of
+    /// inheriting the gateway's cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+
+    /// Shell command to run before each fresh session to generate dynamic context.
+    ///
+    /// The command's stdout is appended to the system prompt via
+    /// `--append-system-prompt`. Runs in `working_dir` if set.
+    /// Only used by subprocess-based providers (e.g. `claude-cli`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_command: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderEntry {
@@ -2453,6 +2468,8 @@ impl std::fmt::Debug for ProviderEntry {
             .field("alias", &self.alias)
             .field("tool_mode", &self.tool_mode)
             .field("cache_retention", &self.cache_retention)
+            .field("working_dir", &self.working_dir)
+            .field("context_command", &self.context_command)
             .finish()
     }
 }
@@ -2470,6 +2487,8 @@ impl Default for ProviderEntry {
             alias: None,
             tool_mode: ToolMode::Auto,
             cache_retention: CacheRetention::Short,
+            working_dir: None,
+            context_command: None,
         }
     }
 }

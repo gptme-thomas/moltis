@@ -29,6 +29,13 @@ pub struct ClaudeCliProvider {
     system_prompt: Option<String>,
     /// Path to the `claude` binary. Defaults to "claude" (resolved via PATH).
     claude_binary: String,
+    /// Working directory for spawned `claude` processes.
+    /// When set, the subprocess starts in this directory.
+    working_dir: Option<String>,
+    /// Command to run before each fresh session to generate additional context.
+    /// The command's stdout is appended to the system prompt.
+    /// Runs in `working_dir` if set, otherwise inherits the gateway's cwd.
+    context_command: Option<String>,
     /// Tracks the active session UUID for `--resume` across multi-turn tool loops.
     /// `None` means no active session (next call starts fresh with `--session-id`).
     active_session: Mutex<Option<String>>,
@@ -41,6 +48,8 @@ impl ClaudeCliProvider {
             model,
             system_prompt: None,
             claude_binary: "claude".into(),
+            working_dir: None,
+            context_command: None,
             active_session: Mutex::new(None),
         }
     }
@@ -58,6 +67,61 @@ impl ClaudeCliProvider {
     pub fn with_binary(mut self, path: String) -> Self {
         self.claude_binary = path;
         self
+    }
+
+    /// Set the working directory for spawned `claude` processes.
+    #[must_use]
+    pub fn with_working_dir(mut self, dir: String) -> Self {
+        self.working_dir = Some(dir);
+        self
+    }
+
+    /// Set a command to run before each fresh session to generate context.
+    /// The command's stdout is appended to the system prompt.
+    #[must_use]
+    pub fn with_context_command(mut self, cmd: String) -> Self {
+        self.context_command = Some(cmd);
+        self
+    }
+
+    /// Run the context command (if configured) and return its stdout.
+    fn run_context_command(&self) -> Option<String> {
+        let cmd = self.context_command.as_ref()?;
+
+        let mut command = std::process::Command::new("bash");
+        command.args(["-c", cmd]);
+        if let Some(ref dir) = self.working_dir {
+            command.current_dir(dir);
+        }
+
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                if text.is_empty() {
+                    warn!("context_command produced no output");
+                    None
+                } else {
+                    info!(
+                        len = text.len(),
+                        "context_command produced dynamic context"
+                    );
+                    Some(text)
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    exit_code = output.status.code(),
+                    stderr = %stderr,
+                    "context_command failed"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to run context_command");
+                None
+            }
+        }
     }
 
     /// Build CLI arguments and prompt for a `claude --print` invocation,
@@ -149,9 +213,19 @@ impl ClaudeCliProvider {
         };
 
         let merged_system = merged_system.map(|s| adapt_system_prompt_for_cli(&s));
-        let has_system_prompt = merged_system.is_some();
-        let system_prompt_len = merged_system.as_ref().map_or(0, |s| s.len());
-        if let Some(sys) = merged_system {
+
+        // Append dynamic context from context_command (if configured).
+        let dynamic_context = self.run_context_command();
+        let final_system = match (merged_system, dynamic_context) {
+            (Some(sys), Some(ctx)) => Some(format!("{sys}\n\n{ctx}")),
+            (Some(sys), None) => Some(sys),
+            (None, Some(ctx)) => Some(ctx),
+            (None, None) => None,
+        };
+
+        let has_system_prompt = final_system.is_some();
+        let system_prompt_len = final_system.as_ref().map_or(0, |s| s.len());
+        if let Some(sys) = final_system {
             args.push("--append-system-prompt".into());
             args.push(sys);
         }
@@ -595,12 +669,15 @@ impl LlmProvider for ClaudeCliProvider {
         );
         trace!(prompt = %prompt, "claude-cli prompt");
 
-        let output = tokio::process::Command::new(&self.claude_binary)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&self.claude_binary);
+        cmd.args(&args)
             .env_remove("CLAUDECODE")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
+            .stderr(std::process::Stdio::piped());
+        if let Some(ref dir) = self.working_dir {
+            cmd.current_dir(dir);
+        }
+        let output = cmd.spawn()?
             .wait_with_output()
             .await?;
 
@@ -665,12 +742,15 @@ impl LlmProvider for ClaudeCliProvider {
             );
             trace!(prompt = %prompt, "claude-cli stream prompt");
 
-            let child = match tokio::process::Command::new(&self.claude_binary)
-                .args(&args)
+            let mut cmd = tokio::process::Command::new(&self.claude_binary);
+            cmd.args(&args)
                 .env_remove("CLAUDECODE")
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
+                .stderr(std::process::Stdio::piped());
+            if let Some(ref dir) = self.working_dir {
+                cmd.current_dir(dir);
+            }
+            let child = match cmd.spawn()
             {
                 Ok(child) => child,
                 Err(e) => {

@@ -2725,10 +2725,12 @@ impl ProviderRegistry {
         }
 
         // Check that the `claude` binary exists on PATH.
-        let claude_binary = config
-            .get("claude-cli")
+        let entry = config.get("claude-cli");
+        let claude_binary = entry
             .and_then(|e| e.base_url.clone()) // Reuse base_url field for binary path.
             .unwrap_or_else(|| "claude".into());
+        let working_dir = entry.and_then(|e| e.working_dir.clone());
+        let context_command = entry.and_then(|e| e.context_command.clone());
 
         let preferred = configured_models_for_provider(config, "claude-cli");
         let discovered: Vec<DiscoveredModel> = if preferred.is_empty() {
@@ -2749,10 +2751,15 @@ impl ProviderRegistry {
             if self.has_provider_model("claude-cli", &model_id) {
                 continue;
             }
-            let provider = Arc::new(
-                claude_cli::ClaudeCliProvider::new(model_id.clone())
-                    .with_binary(claude_binary.clone()),
-            );
+            let mut p = claude_cli::ClaudeCliProvider::new(model_id.clone())
+                .with_binary(claude_binary.clone());
+            if let Some(ref dir) = working_dir {
+                p = p.with_working_dir(dir.clone());
+            }
+            if let Some(ref cmd) = context_command {
+                p = p.with_context_command(cmd.clone());
+            }
+            let provider = Arc::new(p);
             self.register(
                 ModelInfo {
                     id: model_id,
@@ -2766,6 +2773,7 @@ impl ProviderRegistry {
 
         tracing::info!(
             binary = %claude_binary,
+            working_dir = working_dir.as_deref().unwrap_or("(inherit)"),
             "claude-cli provider registered"
         );
     }

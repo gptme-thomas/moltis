@@ -128,6 +128,7 @@ pub fn detect_project(dir: &Path) -> Option<Project> {
         teardown_command: None,
         branch_prefix: None,
         sandbox_image: None,
+        context_command: None,
         detected: true,
         created_at: now,
         updated_at: now,

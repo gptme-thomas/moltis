@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 /// A project represents a codebase directory that moltis can work with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,11 @@ pub struct Project {
     pub branch_prefix: Option<String>,
     #[serde(default)]
     pub sandbox_image: Option<String>,
+    /// Shell command to run at session start to generate dynamic context.
+    /// Stdout is appended to the project context for system prompt injection.
+    /// Runs in the project's `directory`.
+    #[serde(default)]
+    pub context_command: Option<String>,
     #[serde(default)]
     pub detected: bool,
     pub created_at: u64,
@@ -124,7 +130,59 @@ impl ProjectContext {
                 cf.content
             ));
         }
+        if let Some(dynamic) = self.run_context_command() {
+            out.push_str(&dynamic);
+            out.push('\n');
+        }
         out
+    }
+
+    /// Run the project's `context_command` (if set) and return its stdout.
+    fn run_context_command(&self) -> Option<String> {
+        let cmd = self.project.context_command.as_ref()?;
+
+        let output = std::process::Command::new("bash")
+            .args(["-c", cmd])
+            .current_dir(&self.project.directory)
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                if text.is_empty() {
+                    warn!(
+                        project = %self.project.label,
+                        "context_command produced no output"
+                    );
+                    None
+                } else {
+                    info!(
+                        project = %self.project.label,
+                        len = text.len(),
+                        "context_command produced dynamic context"
+                    );
+                    Some(text)
+                }
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                warn!(
+                    project = %self.project.label,
+                    exit_code = o.status.code(),
+                    stderr = %stderr,
+                    "context_command failed"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    project = %self.project.label,
+                    error = %e,
+                    "failed to run context_command"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -143,6 +201,7 @@ mod tests {
             teardown_command: None,
             branch_prefix: None,
             sandbox_image: None,
+            context_command: None,
             detected: false,
             created_at: 0,
             updated_at: 0,

@@ -3983,7 +3983,8 @@ pub async fn prepare_gateway_core(
             Arc::clone(&session_metadata),
         )
         .with_tools(Arc::clone(&shared_tool_registry))
-        .with_failover(config.failover.clone());
+        .with_failover(config.failover.clone())
+        .with_global_context_command(config.chat.context_command.clone());
 
         if let Some(ref hooks) = state.inner.read().await.hook_registry {
             chat_service = chat_service.with_hooks_arc(Arc::clone(hooks));

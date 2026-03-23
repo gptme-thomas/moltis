@@ -1506,6 +1506,13 @@ pub struct ChatConfig {
     /// live discovery), so this field is currently ignored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
+    /// Global shell command to run at session start to generate dynamic context.
+    ///
+    /// The command's stdout is appended to the system prompt for ALL sessions,
+    /// regardless of project binding. Runs in the gateway's working directory.
+    /// Use this for workspace-wide context (task status, journal, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_command: Option<String>,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1523,6 +1530,7 @@ impl Default for ChatConfig {
             workspace_file_max_chars: default_workspace_file_max_chars(),
             priority_models: Vec::new(),
             allowed_models: Vec::new(),
+            context_command: None,
         }
     }
 }

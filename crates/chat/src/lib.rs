@@ -2588,6 +2588,8 @@ pub struct LiveChatService {
     active_reply_medium: Arc<RwLock<HashMap<String, ReplyMedium>>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
+    /// Global context command from `[chat] context_command`.
+    global_context_command: Option<String>,
 }
 
 impl LiveChatService {
@@ -2618,11 +2620,17 @@ impl LiveChatService {
             active_partial_assistant: Arc::new(RwLock::new(HashMap::new())),
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             failover_config: moltis_config::schema::FailoverConfig::default(),
+            global_context_command: None,
         }
     }
 
     pub fn with_failover(mut self, config: moltis_config::schema::FailoverConfig) -> Self {
         self.failover_config = config;
+        self
+    }
+
+    pub fn with_global_context_command(mut self, cmd: Option<String>) -> Self {
+        self.global_context_command = cmd;
         self
     }
 
@@ -2908,6 +2916,61 @@ impl LiveChatService {
             worktree_dir,
         };
         Some(ctx.to_prompt_section())
+    }
+
+    /// Run the global `[chat] context_command` (if configured) and return its stdout.
+    fn run_global_context_command(&self) -> Option<String> {
+        let cmd = self.global_context_command.as_ref()?;
+
+        let output = std::process::Command::new("bash")
+            .args(["-c", cmd])
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                if text.is_empty() {
+                    warn!("global context_command produced no output");
+                    None
+                } else {
+                    info!(
+                        len = text.len(),
+                        "global context_command produced dynamic context"
+                    );
+                    Some(text)
+                }
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                warn!(
+                    exit_code = o.status.code(),
+                    stderr = %stderr,
+                    "global context_command failed"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to run global context_command");
+                None
+            }
+        }
+    }
+
+    /// Resolve the full context for a session: global context + project context.
+    async fn resolve_full_context(
+        &self,
+        session_key: &str,
+        conn_id: Option<&str>,
+    ) -> Option<String> {
+        let global = self.run_global_context_command();
+        let project = self.resolve_project_context(session_key, conn_id).await;
+
+        match (global, project) {
+            (Some(g), Some(p)) => Some(format!("{p}\n\n{g}")),
+            (Some(g), None) => Some(g),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        }
     }
 }
 
@@ -3432,7 +3495,7 @@ impl ChatService for LiveChatService {
 
         // Resolve project context for this connection's active project.
         let project_context = self
-            .resolve_project_context(&session_key, conn_id.as_deref())
+            .resolve_full_context(&session_key, conn_id.as_deref())
             .await;
 
         // Dispatch MessageReceived hook (read-only).
@@ -4890,7 +4953,7 @@ impl ChatService for LiveChatService {
 
         // Resolve project context.
         let project_context = self
-            .resolve_project_context(&session_key, conn_id.as_deref())
+            .resolve_full_context(&session_key, conn_id.as_deref())
             .await;
 
         // Discover skills.
@@ -5015,7 +5078,7 @@ impl ChatService for LiveChatService {
 
         // Resolve project context.
         let project_context = self
-            .resolve_project_context(&session_key, conn_id.as_deref())
+            .resolve_full_context(&session_key, conn_id.as_deref())
             .await;
 
         // Discover skills.

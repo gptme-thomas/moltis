@@ -39,6 +39,10 @@ pub struct ClaudeCliProvider {
     /// Tracks the active session UUID for `--resume` across multi-turn tool loops.
     /// `None` means no active session (next call starts fresh with `--session-id`).
     active_session: Mutex<Option<String>>,
+    /// Number of messages in the Moltis history when this provider last ran.
+    /// Used to detect when other providers have added messages (model switching)
+    /// so we can clear the stale Claude CLI session and start fresh.
+    last_seen_msg_count: Mutex<usize>,
 }
 
 impl ClaudeCliProvider {
@@ -51,6 +55,7 @@ impl ClaudeCliProvider {
             working_dir: None,
             context_command: None,
             active_session: Mutex::new(None),
+            last_seen_msg_count: Mutex::new(0),
         }
     }
 
@@ -179,6 +184,29 @@ impl ClaudeCliProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let last_count = *self
+            .last_seen_msg_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Detect model-switch divergence: if the Moltis history grew by more
+        // than 2 messages (user + assistant) since our last run, another
+        // provider handled turns we haven't seen. Clear the CLI session so we
+        // start fresh with the full conversation history.
+        if existing.is_some() && last_count > 0 && messages.len() > last_count + 2 {
+            info!(
+                last_count,
+                current_count = messages.len(),
+                "claude-cli: history diverged (model switch detected), starting fresh session"
+            );
+            self.clear_session();
+        }
+
+        let existing = self
+            .active_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(sid) = existing {
             args.push("--resume".into());
             args.push(sid.clone());
@@ -188,6 +216,10 @@ impl ClaudeCliProvider {
                 prompt_len = prompt.len(),
                 "claude-cli: resuming session"
             );
+            *self
+                .last_seen_msg_count
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = messages.len();
             args.push(prompt.clone());
             return (args, prompt);
         }
@@ -203,6 +235,13 @@ impl ClaudeCliProvider {
             .active_session
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
+
+        // Record how many messages are in the history at session creation,
+        // so we can detect model-switch divergence on subsequent calls.
+        *self
+            .last_seen_msg_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = messages.len();
 
         // Merge system prompts from struct config and from messages.
         let merged_system = match (&self.system_prompt, &extra_system) {
@@ -249,6 +288,10 @@ impl ClaudeCliProvider {
             .active_session
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .last_seen_msg_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
     }
 }
 

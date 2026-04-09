@@ -2766,6 +2766,7 @@ impl ProviderRegistry {
                     provider: "claude-cli".into(),
                     display_name,
                     created_at,
+                    recommended: false,
                 },
                 provider,
             );

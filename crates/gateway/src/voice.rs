@@ -516,9 +516,11 @@ impl LiveSttService {
         }
     }
 
-    /// Load fresh STT config from disk and create provider on demand.
-    fn create_provider(provider_id: SttProviderId) -> Option<Box<dyn SttProvider + Send + Sync>> {
-        let cfg = moltis_config::discover_and_load();
+    /// Create a provider on-demand from explicit config.
+    fn create_provider_with_config(
+        cfg: &moltis_config::MoltisConfig,
+        provider_id: SttProviderId,
+    ) -> Option<Box<dyn SttProvider + Send + Sync>> {
         match provider_id {
             SttProviderId::Whisper => {
                 let key = resolve_openai_key(cfg.voice.stt.whisper.api_key.as_ref(), &cfg);
@@ -601,52 +603,53 @@ impl LiveSttService {
         }
     }
 
+    /// Load fresh STT config from disk and create provider on demand.
+    fn create_provider(provider_id: SttProviderId) -> Option<Box<dyn SttProvider + Send + Sync>> {
+        let cfg = moltis_config::discover_and_load();
+        Self::create_provider_with_config(&cfg, provider_id)
+    }
+
+    const PROVIDER_IDS: [SttProviderId; 9] = [
+        SttProviderId::Whisper,
+        SttProviderId::Groq,
+        SttProviderId::Deepgram,
+        SttProviderId::Google,
+        SttProviderId::Mistral,
+        SttProviderId::VoxtralLocal,
+        SttProviderId::WhisperCli,
+        SttProviderId::SherpaOnnx,
+        SttProviderId::ElevenLabs,
+    ];
+
+    fn list_providers_with_config(cfg: &moltis_config::MoltisConfig) -> Vec<(SttProviderId, bool)> {
+        Self::PROVIDER_IDS
+            .into_iter()
+            .map(|provider_id| {
+                let configured = Self::create_provider_with_config(cfg, provider_id).is_some();
+                (provider_id, configured)
+            })
+            .collect()
+    }
+
     /// List all providers with their configuration status (reads fresh config).
     fn list_providers() -> Vec<(SttProviderId, bool)> {
         let cfg = moltis_config::discover_and_load();
-        vec![
-            (
-                SttProviderId::Whisper,
-                cfg.voice.stt.whisper.api_key.is_some(),
-            ),
-            (SttProviderId::Groq, cfg.voice.stt.groq.api_key.is_some()),
-            (
-                SttProviderId::Deepgram,
-                cfg.voice.stt.deepgram.api_key.is_some(),
-            ),
-            (
-                SttProviderId::Google,
-                cfg.voice.stt.google.api_key.is_some(),
-            ),
-            (
-                SttProviderId::Mistral,
-                cfg.voice.stt.mistral.api_key.is_some(),
-            ),
-            (SttProviderId::VoxtralLocal, true), // Always available
-            (
-                SttProviderId::WhisperCli,
-                cfg.voice.stt.whisper_cli.model_path.is_some(),
-            ),
-            (
-                SttProviderId::SherpaOnnx,
-                cfg.voice.stt.sherpa_onnx.model_dir.is_some(),
-            ),
-            (
-                SttProviderId::ElevenLabs,
-                cfg.voice.stt.elevenlabs.api_key.is_some(),
-            ),
-        ]
+        Self::list_providers_with_config(&cfg)
     }
 
-    /// Resolve the active provider: explicit config value, or first configured.
-    fn resolve_provider(
+    fn resolve_provider_with_config(
+        cfg: &moltis_config::MoltisConfig,
         config_provider: Option<moltis_config::VoiceSttProvider>,
     ) -> Option<SttProviderId> {
-        if let Some(p) = config_provider {
-            return SttProviderId::parse(p.as_str());
+        if let Some(provider_id) =
+            config_provider.and_then(|provider| SttProviderId::parse(provider.as_str()))
+        {
+            if Self::create_provider_with_config(cfg, provider_id).is_some() {
+                return Some(provider_id);
+            }
         }
-        // Auto-select: first configured provider
-        Self::list_providers()
+
+        Self::list_providers_with_config(cfg)
             .into_iter()
             .find(|(_, configured)| *configured)
             .map(|(id, _)| id)
@@ -658,12 +661,12 @@ impl LiveSttService {
 impl SttService for LiveSttService {
     async fn status(&self) -> ServiceResult {
         let cfg = moltis_config::discover_and_load();
-        let providers = Self::list_providers();
+        let providers = Self::list_providers_with_config(&cfg);
         let any_configured = providers.iter().any(|(_, configured)| *configured);
-        let resolved = Self::resolve_provider(cfg.voice.stt.provider);
+        let resolved = Self::resolve_provider_with_config(&cfg, cfg.voice.stt.provider);
 
         Ok(json!({
-            "enabled": any_configured,
+            "enabled": cfg.voice.stt.enabled && any_configured,
             "provider": resolved.map(|p| p.to_string()).unwrap_or_default(),
             "configured": any_configured,
         }))
@@ -719,17 +722,20 @@ impl SttService for LiveSttService {
     ) -> ServiceResult {
         let cfg = moltis_config::discover_and_load();
         let audio_len = audio.len();
+        if !cfg.voice.stt.enabled {
+            return Err("STT is not enabled".into());
+        }
 
         let provider_id = match provider {
             Some(s) => {
                 SttProviderId::parse(s).ok_or_else(|| format!("unknown STT provider '{s}'"))?
             },
-            None => Self::resolve_provider(cfg.voice.stt.provider)
+            None => Self::resolve_provider_with_config(&cfg, cfg.voice.stt.provider)
                 .ok_or_else(|| "no STT provider configured".to_string())?,
         };
 
         let stt_provider: Box<dyn SttProvider + Send + Sync> =
-            Self::create_provider(provider_id)
+            Self::create_provider_with_config(&cfg, provider_id)
                 .ok_or_else(|| format!("STT provider '{}' not configured", provider_id))?;
 
         let request = TranscribeRequest {
@@ -848,11 +854,41 @@ mod tests {
 
     #[test]
     fn test_live_stt_resolve_provider_handles_explicit_and_auto_selection() {
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.voice.stt.whisper.api_key = Some(Secret::new("test-whisper-key".to_string()));
+
         assert_eq!(
-            LiveSttService::resolve_provider(Some(moltis_config::VoiceSttProvider::Whisper)),
+            LiveSttService::resolve_provider_with_config(
+                &cfg,
+                Some(moltis_config::VoiceSttProvider::Whisper),
+            ),
             Some(SttProviderId::Whisper)
         );
-        assert!(LiveSttService::resolve_provider(None).is_some());
+        assert_eq!(
+            LiveSttService::resolve_provider_with_config(
+                &cfg,
+                Some(moltis_config::VoiceSttProvider::VoxtralLocal),
+            ),
+            Some(SttProviderId::Whisper)
+        );
+        assert_eq!(
+            LiveSttService::resolve_provider_with_config(
+                &moltis_config::MoltisConfig::default(),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_live_stt_default_config_does_not_mark_voxtral_local_configured() {
+        let providers =
+            LiveSttService::list_providers_with_config(&moltis_config::MoltisConfig::default());
+        let voxtral = providers
+            .into_iter()
+            .find(|(id, _)| *id == SttProviderId::VoxtralLocal)
+            .expect("voxtral-local should be listed");
+        assert!(!voxtral.1);
     }
 
     #[tokio::test]
@@ -918,9 +954,14 @@ mod tests {
         assert!(status.get("enabled").is_some());
         assert!(status.get("configured").is_some());
         assert!(status.get("provider").is_some());
-        // voxtral-local is always considered "configured" (local service)
-        // so configured will be true even with no API keys
-        assert_eq!(status["configured"], true);
+        let configured = status["configured"].as_bool().unwrap_or(false);
+        let enabled = status["enabled"].as_bool().unwrap_or(false);
+        let provider = status["provider"].as_str().unwrap_or_default();
+
+        if !configured {
+            assert!(!enabled);
+            assert!(provider.is_empty());
+        }
     }
 
     #[tokio::test]

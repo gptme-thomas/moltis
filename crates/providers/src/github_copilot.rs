@@ -812,7 +812,9 @@ fn stream_events_to_completion(events: Vec<StreamEvent>) -> CompletionResponse {
             StreamEvent::Done(u) => usage = u,
             StreamEvent::Error(_)
             | StreamEvent::ProviderRaw(_)
-            | StreamEvent::ReasoningDelta(_) => {},
+            | StreamEvent::ReasoningDelta(_)
+            | StreamEvent::ObservedToolStart { .. }
+            | StreamEvent::ObservedToolEnd { .. } => {},
         }
     }
 

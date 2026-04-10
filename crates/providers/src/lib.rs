@@ -2767,6 +2767,7 @@ impl ProviderRegistry {
                     display_name,
                     created_at,
                     recommended: false,
+                    capabilities: ModelCapabilities::default(),
                 },
                 provider,
             );

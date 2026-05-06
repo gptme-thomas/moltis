@@ -132,8 +132,9 @@ impl ClaudeCliProvider {
     /// Build CLI arguments and prompt for a `claude --print` invocation,
     /// handling session resume for multi-turn conversations and tool loops.
     ///
-    /// Returns `(args, prompt_text)` where `args` includes the prompt as
-    /// the last positional argument.
+    /// Returns `(args, prompt_text)` where the prompt is **not** included
+    /// in `args` — callers must deliver it via stdin to avoid hitting
+    /// Linux's 128 KB per-argument limit (MAX_ARG_STRLEN / E2BIG).
     ///
     /// - **Resume** (active session exists): uses `--resume`, sends only the
     ///   new content — tool results or the latest user message.
@@ -220,7 +221,6 @@ impl ClaudeCliProvider {
                 .last_seen_msg_count
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = messages.len();
-            args.push(prompt.clone());
             return (args, prompt);
         }
 
@@ -278,7 +278,6 @@ impl ClaudeCliProvider {
             "claude-cli: starting fresh session"
         );
 
-        args.push(prompt.clone());
         (args, prompt)
     }
 
@@ -674,6 +673,19 @@ fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
     }
 }
 
+fn friendly_spawn_error(e: &std::io::Error, prompt_len: usize) -> anyhow::Error {
+    if e.raw_os_error() == Some(7) || e.to_string().contains("Argument list too long") {
+        anyhow::anyhow!(
+            "Conversation too large to send ({:.0} KB in argv). \
+             Run /compact to shrink context, or /new to start fresh. \
+             (OS error: {e})",
+            prompt_len as f64 / 1024.0,
+        )
+    } else {
+        anyhow::anyhow!("failed to spawn claude CLI: {e}")
+    }
+}
+
 #[async_trait]
 impl LlmProvider for ClaudeCliProvider {
     fn name(&self) -> &str {
@@ -715,14 +727,29 @@ impl LlmProvider for ClaudeCliProvider {
         let mut cmd = tokio::process::Command::new(&self.claude_binary);
         cmd.args(&args)
             .env_remove("CLAUDECODE")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if let Some(ref dir) = self.working_dir {
             cmd.current_dir(dir);
         }
-        let output = cmd.spawn()?
-            .wait_with_output()
-            .await?;
+        let mut child = cmd.spawn().map_err(|e| {
+            self.clear_session();
+            friendly_spawn_error(&e, prompt.len())
+        })?;
+
+        // Deliver the prompt via stdin to avoid Linux's 128 KB
+        // per-argument limit (MAX_ARG_STRLEN).
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
+                self.clear_session();
+                anyhow::anyhow!("failed to write prompt to claude CLI stdin: {e}")
+            })?;
+        }
+
+        let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -788,20 +815,40 @@ impl LlmProvider for ClaudeCliProvider {
             let mut cmd = tokio::process::Command::new(&self.claude_binary);
             cmd.args(&args)
                 .env_remove("CLAUDECODE")
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             if let Some(ref dir) = self.working_dir {
                 cmd.current_dir(dir);
             }
-            let child = match cmd.spawn()
+            let mut child = match cmd.spawn()
             {
                 Ok(child) => child,
                 Err(e) => {
                     self.clear_session();
-                    yield StreamEvent::Error(format!("failed to spawn claude CLI: {e}"));
+                    yield StreamEvent::Error(friendly_spawn_error(&e, prompt.len()).to_string());
                     return;
                 }
             };
+
+            // Deliver the prompt via stdin to avoid Linux's 128 KB
+            // per-argument limit (MAX_ARG_STRLEN).
+            {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = match child.stdin.take() {
+                    Some(s) => s,
+                    None => {
+                        self.clear_session();
+                        yield StreamEvent::Error("claude CLI stdin not captured".into());
+                        return;
+                    }
+                };
+                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                    self.clear_session();
+                    yield StreamEvent::Error(format!("failed to write prompt to claude CLI stdin: {e}"));
+                    return;
+                }
+            }
 
             let stdout = match child.stdout {
                 Some(stdout) => stdout,
@@ -1426,6 +1473,81 @@ mod tests {
 
         assert!(args.contains(&"--resume".into()));
         assert_eq!(prompt, "Describe this");
+    }
+
+    // ── stdin prompt delivery (argv stays small) ──────────────────────
+
+    #[test]
+    fn prompt_not_in_argv() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let messages = vec![ChatMessage::user("Hello world")];
+        let (args, prompt) = provider.build_session_args(&messages, "json");
+
+        assert_eq!(prompt, "Hello world");
+        assert!(
+            !args.contains(&"Hello world".to_string()),
+            "prompt must not appear in argv — it goes via stdin"
+        );
+    }
+
+    #[test]
+    fn large_prompt_not_in_argv() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let big = "x".repeat(200_000);
+        let messages = vec![ChatMessage::user(&big)];
+        let (args, prompt) = provider.build_session_args(&messages, "stream-json");
+
+        assert_eq!(prompt.len(), 200_000);
+        let argv_bytes: usize = args.iter().map(|a| a.len()).sum();
+        assert!(
+            argv_bytes < 10_000,
+            "argv should be small (flags only), got {argv_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn resume_prompt_not_in_argv() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+
+        let messages_2 = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi!"),
+            ChatMessage::user("Follow-up question with details"),
+        ];
+        let (args, prompt) = provider.build_session_args(&messages_2, "json");
+
+        assert_eq!(prompt, "Follow-up question with details");
+        assert!(
+            !args.contains(&prompt),
+            "resume prompt must not appear in argv"
+        );
+    }
+
+    // ── friendly_spawn_error ────────────────────────────────────────────
+
+    #[test]
+    fn e2big_error_gives_friendly_message() {
+        let io_err = std::io::Error::from_raw_os_error(7); // E2BIG
+        let friendly = friendly_spawn_error(&io_err, 140_000);
+        let msg = friendly.to_string();
+        assert!(msg.contains("/compact"), "should suggest /compact: {msg}");
+        assert!(msg.contains("/new"), "should suggest /new: {msg}");
+        assert!(msg.contains("137"), "should show size in KB: {msg}");
+    }
+
+    #[test]
+    fn non_e2big_error_uses_generic_message() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file");
+        let friendly = friendly_spawn_error(&io_err, 1000);
+        let msg = friendly.to_string();
+        assert!(
+            msg.contains("failed to spawn claude CLI"),
+            "should use generic prefix: {msg}"
+        );
+        assert!(!msg.contains("/compact"), "should not suggest /compact: {msg}");
     }
 
     // ── adapt_system_prompt_for_cli ───────────────────────────────────

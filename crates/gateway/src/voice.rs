@@ -501,6 +501,18 @@ impl Default for SttServiceConfig {
 
 #[cfg(feature = "voice")]
 impl LiveSttService {
+    const PROVIDER_IDS: [SttProviderId; 9] = [
+        SttProviderId::Whisper,
+        SttProviderId::Groq,
+        SttProviderId::Deepgram,
+        SttProviderId::Google,
+        SttProviderId::Mistral,
+        SttProviderId::VoxtralLocal,
+        SttProviderId::WhisperCli,
+        SttProviderId::SherpaOnnx,
+        SttProviderId::ElevenLabs,
+    ];
+
     /// Create a new STT service. Config is read fresh on each operation.
     #[allow(unused_variables)]
     pub fn new(config: SttServiceConfig) -> Self {
@@ -608,18 +620,6 @@ impl LiveSttService {
         let cfg = moltis_config::discover_and_load();
         Self::create_provider_with_config(&cfg, provider_id)
     }
-
-    const PROVIDER_IDS: [SttProviderId; 9] = [
-        SttProviderId::Whisper,
-        SttProviderId::Groq,
-        SttProviderId::Deepgram,
-        SttProviderId::Google,
-        SttProviderId::Mistral,
-        SttProviderId::VoxtralLocal,
-        SttProviderId::WhisperCli,
-        SttProviderId::SherpaOnnx,
-        SttProviderId::ElevenLabs,
-    ];
 
     fn list_providers_with_config(cfg: &moltis_config::MoltisConfig) -> Vec<(SttProviderId, bool)> {
         Self::PROVIDER_IDS

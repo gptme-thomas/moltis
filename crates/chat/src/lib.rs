@@ -2939,7 +2939,7 @@ impl LiveChatService {
                     );
                     Some(text)
                 }
-            }
+            },
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 warn!(
@@ -2948,11 +2948,11 @@ impl LiveChatService {
                     "global context_command failed"
                 );
                 None
-            }
+            },
             Err(e) => {
                 warn!(error = %e, "failed to run global context_command");
                 None
-            }
+            },
         }
     }
 
@@ -6780,9 +6780,8 @@ async fn run_with_tools(
                     result,
                     is_error,
                 } => {
-                    let result_val = result.map(|r| {
-                        serde_json::json!({ "stdout": r, "stderr": "", "exit_code": 0 })
-                    });
+                    let result_val = result
+                        .map(|r| serde_json::json!({ "stdout": r, "stderr": "", "exit_code": 0 }));
                     serde_json::json!({
                         "runId": run_id,
                         "sessionKey": sk,

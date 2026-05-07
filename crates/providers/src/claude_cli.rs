@@ -726,7 +726,10 @@ impl LlmProvider for ClaudeCliProvider {
         // per-argument limit (MAX_ARG_STRLEN).
         {
             use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take().expect("stdin was piped");
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("stdin was not piped on spawned claude CLI"))?;
             stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
                 self.clear_session();
                 anyhow::anyhow!("failed to write prompt to claude CLI stdin: {e}")

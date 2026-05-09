@@ -297,7 +297,7 @@ function DeliveryRow({ delivery }) {
         <span class="text-[var(--muted)]">
           ${d.receivedAt ? new Date(d.receivedAt).toLocaleString() : ""}
         </span>
-        ${d.durationMs != null ? html`<span class="text-[var(--muted)]">${d.durationMs}ms</span>` : ""}
+        ${d.durationMs == null ? "" : html`<span class="text-[var(--muted)]">${d.durationMs}ms</span>`}
       </div>
       <div class="flex items-center gap-2">
         ${

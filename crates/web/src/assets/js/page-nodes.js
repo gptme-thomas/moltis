@@ -419,7 +419,7 @@ function NodeTelemetry({ telemetry }) {
 	}
 
 	return html`<div class="mt-1.5 flex flex-col gap-1">
-		${telemetry.cpuUsage != null ? html`<${TelemetryBar} label="CPU" value=${telemetry.cpuUsage} max=${100} />` : null}
+		${telemetry.cpuUsage == null ? null : html`<${TelemetryBar} label="CPU" value=${telemetry.cpuUsage} max=${100} />`}
 		${
 			telemetry.memTotal != null && telemetry.memAvailable != null
 				? html`<${TelemetryBar}
@@ -557,7 +557,7 @@ function RemoteExecStatusCard() {
 						${doctorTest.value.route_label || "Active SSH route"}
 					</div>
 					<div class="${doctorTest.value.reachable ? "text-green-500" : "text-red-500"} mt-1">
-						${doctorTest.value.reachable ? "Reachable" : "Unreachable"}${doctorTest.value.exit_code != null ? ` (exit ${doctorTest.value.exit_code})` : ""}
+						${doctorTest.value.reachable ? "Reachable" : "Unreachable"}${doctorTest.value.exit_code == null ? "" : ` (exit ${doctorTest.value.exit_code})`}
 					</div>
 					${
 						doctorTest.value.failure_hint

@@ -1093,7 +1093,7 @@ function pollOAuthStatus(provider, onAuthenticated) {
 			return;
 		}
 		sendRpc("providers.oauth.status", { provider: provider.name }).then((res) => {
-			if (res?.ok && res.payload && res.payload.authenticated) {
+			if (res?.ok && res.payload?.authenticated) {
 				clearOAuthStatusTimer();
 				if (typeof onAuthenticated === "function") {
 					onAuthenticated();
@@ -1992,11 +1992,11 @@ export function showModelDownloadProgress(model, provider) {
 		}
 		if (payload.downloaded != null) {
 			var downloadedMb = (payload.downloaded / (1024 * 1024)).toFixed(1);
-			if (payload.total != null) {
+			if (payload.total == null) {
+				progressText.textContent = `${downloadedMb} MB downloaded`;
+			} else {
 				var totalMb = (payload.total / (1024 * 1024)).toFixed(1);
 				progressText.textContent = `${downloadedMb} MB / ${totalMb} MB`;
-			} else {
-				progressText.textContent = `${downloadedMb} MB downloaded`;
 			}
 		}
 	});
@@ -2062,11 +2062,11 @@ function selectLocalModel(model, provider) {
 		}
 		if (payload.downloaded != null) {
 			var downloadedMb = (payload.downloaded / (1024 * 1024)).toFixed(1);
-			if (payload.total != null) {
+			if (payload.total == null) {
+				progressText.textContent = `${downloadedMb} MB downloaded`;
+			} else {
 				var totalMb = (payload.total / (1024 * 1024)).toFixed(1);
 				progressText.textContent = `${downloadedMb} MB / ${totalMb} MB`;
-			} else {
-				progressText.textContent = `${downloadedMb} MB downloaded`;
 			}
 		}
 	});

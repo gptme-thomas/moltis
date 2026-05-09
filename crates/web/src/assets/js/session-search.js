@@ -79,11 +79,11 @@ function renderSearchResults(query) {
 
 		el.addEventListener("click", () => {
 			var ctx = { query: query, messageIndex: hit.messageIndex };
-			if (currentPrefix !== "/chats") {
+			if (currentPrefix === "/chats") {
+				switchSession(hit.sessionKey, ctx);
+			} else {
 				sessionStorage.setItem("moltis-search-ctx", JSON.stringify(ctx));
 				navigate(sessionPath(hit.sessionKey));
-			} else {
-				switchSession(hit.sessionKey, ctx);
 			}
 			searchInput.value = "";
 			hideSearch();
@@ -123,11 +123,11 @@ searchInput.addEventListener("keydown", (e) => {
 				query: searchInput.value.trim(),
 				messageIndex: h.messageIndex,
 			};
-			if (currentPrefix !== "/chats") {
+			if (currentPrefix === "/chats") {
+				switchSession(h.sessionKey, ctx);
+			} else {
 				sessionStorage.setItem("moltis-search-ctx", JSON.stringify(ctx));
 				navigate(sessionPath(h.sessionKey));
-			} else {
-				switchSession(h.sessionKey, ctx);
 			}
 			searchInput.value = "";
 			hideSearch();

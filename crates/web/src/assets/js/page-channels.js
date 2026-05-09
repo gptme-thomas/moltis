@@ -167,11 +167,11 @@ function MatrixOwnershipCard({ channel, matrixStatus }) {
 	var modeTitle =
 		ownershipIssue === "approval_required"
 			? "Ownership approval required"
-			: ownershipIssue !== "none"
-				? "Moltis ownership blocked"
-				: ownershipMode === "moltis_owned"
+			: ownershipIssue === "none"
+				? ownershipMode === "moltis_owned"
 					? "Managed by Moltis"
-					: "User-managed in Element";
+					: "User-managed in Element"
+				: "Moltis ownership blocked";
 	var modeText =
 		ownershipIssue === "approval_required"
 			? "This existing Matrix account can already chat, but Matrix needs one browser approval before Moltis can take over encryption ownership. Open the approval page, approve the reset, then retry ownership setup."
@@ -918,8 +918,7 @@ function AddTeamsModal() {
 	    title="Connect Microsoft Teams">
 	    <div class="channel-form">
 	      ${
-					!tsLoading.value &&
-					!(tsStatus.value?.mode === "funnel" && tsStatus.value?.url) &&
+					!(tsLoading.value || (tsStatus.value?.mode === "funnel" && tsStatus.value?.url)) &&
 					html`
 	        <div class="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs flex flex-col gap-2">
 	          <span class="font-medium text-[var(--text-strong)]">Public URL required</span>

@@ -205,8 +205,9 @@ function HookCard({ hook }) {
 
           <div class="flex flex-col gap-1">
             ${
-							hook.source !== "builtin"
-								? html`
+							hook.source === "builtin"
+								? null
+								: html`
             <div class="flex items-center gap-1 border-b border-[var(--border)] px-1">
               <button
                 class="px-3 py-1.5 text-xs font-medium rounded-t-[var(--radius-sm)] transition-colors -mb-px ${tab.value === "preview" ? "bg-[var(--surface2)] border border-[var(--border)] border-b-[var(--surface2)] text-[var(--text-strong)]" : "text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--bg-hover)] border border-transparent"}"
@@ -220,7 +221,6 @@ function HookCard({ hook }) {
 								}}>Source</button>
             </div>
             `
-								: null
 						}
             ${
 							hook.source === "builtin"
@@ -256,14 +256,14 @@ function HookCard({ hook }) {
 
           <div class="flex items-center gap-2">
             ${
-							hook.source !== "builtin"
-								? html`
+							hook.source === "builtin"
+								? null
+								: html`
             <button class=${`provider-btn provider-btn-sm ${hook.enabled ? "provider-btn-secondary" : ""}`}
                     onClick=${handleEnableDisable}>
               ${hook.enabled ? "Disable" : "Enable"}
             </button>
             `
-								: null
 						}
             ${
 							dirty.value

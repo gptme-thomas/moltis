@@ -3982,8 +3982,9 @@ function SummaryStep({ onBack, onFinish }) {
 
 			<!-- Tailscale (hidden if feature not compiled) -->
 			${
-				data.tailscale !== null
-					? html`<${SummaryRow}
+				data.tailscale === null
+					? null
+					: html`<${SummaryRow}
 					icon=${data.tailscale?.tailscale_up ? html`<${CheckIcon} />` : data.tailscale?.installed ? html`<${WarnIcon} />` : html`<${InfoIcon} />`}
 					label="Tailscale">
 					${
@@ -3994,7 +3995,6 @@ function SummaryStep({ onBack, onFinish }) {
 								: html`Not installed. Install Tailscale for secure remote access.`
 					}
 				<//>`
-					: null
 			}
 
 			<!-- Voice (hidden if not enabled) -->

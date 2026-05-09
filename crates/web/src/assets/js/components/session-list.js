@@ -193,10 +193,10 @@ function SessionItem({ session, activeKey, depth, keyMap, refreshing }) {
 		if (event.button !== 0) return;
 		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
 		event.preventDefault();
-		if (currentPrefix !== "/chats") {
-			navigate(href);
-		} else {
+		if (currentPrefix === "/chats") {
 			switchSession(session.key);
+		} else {
+			navigate(href);
 		}
 	}
 

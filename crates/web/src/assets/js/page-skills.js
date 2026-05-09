@@ -119,7 +119,7 @@ function doInstall(source) {
 		if (res?.ok) {
 			var p = res.payload || {};
 			var count = (p.installed || []).length;
-			showToast(`Installed ${source} (${count} skill${count !== 1 ? "s" : ""})`, "success");
+			showToast(`Installed ${source} (${count} skill${count === 1 ? "" : "s"})`, "success");
 			fetchAll();
 			stopInstallProgress(progressId, true);
 		} else {

@@ -643,9 +643,10 @@ impl LiveSttService {
     ) -> Option<SttProviderId> {
         if let Some(provider_id) =
             config_provider.and_then(|provider| SttProviderId::parse(provider.as_str()))
-            && Self::create_provider_with_config(cfg, provider_id).is_some() {
-                return Some(provider_id);
-            }
+            && Self::create_provider_with_config(cfg, provider_id).is_some()
+        {
+            return Some(provider_id);
+        }
 
         Self::list_providers_with_config(cfg)
             .into_iter()

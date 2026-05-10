@@ -535,7 +535,7 @@ impl LiveSttService {
     ) -> Option<Box<dyn SttProvider + Send + Sync>> {
         match provider_id {
             SttProviderId::Whisper => {
-                let key = resolve_openai_key(cfg.voice.stt.whisper.api_key.as_ref(), &cfg);
+                let key = resolve_openai_key(cfg.voice.stt.whisper.api_key.as_ref(), cfg);
                 key.map(|k| {
                     Box::new(WhisperStt::new(Some(k))) as Box<dyn SttProvider + Send + Sync>
                 })
@@ -643,11 +643,9 @@ impl LiveSttService {
     ) -> Option<SttProviderId> {
         if let Some(provider_id) =
             config_provider.and_then(|provider| SttProviderId::parse(provider.as_str()))
-        {
-            if Self::create_provider_with_config(cfg, provider_id).is_some() {
+            && Self::create_provider_with_config(cfg, provider_id).is_some() {
                 return Some(provider_id);
             }
-        }
 
         Self::list_providers_with_config(cfg)
             .into_iter()

@@ -529,10 +529,16 @@ fn tool_results_since_last_assistant(messages: &[ChatMessage]) -> String {
 ///
 /// - `stream_event` → `content_block_delta` → `text_delta` — token-level text delta
 /// - `stream_event` → `content_block_delta` → `thinking_delta` — reasoning delta
-/// - `assistant` — tool_use blocks → `ObservedToolStart` events
+/// - `assistant` — tool_use blocks → `ObservedToolStart` events; text blocks →
+///   `Delta` (only when no `text_delta` was seen, to avoid double-emitting)
 /// - `user` — tool_use_result → `ObservedToolEnd` events
 /// - `result` — session end with usage
-fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
+///
+/// `seen_text_delta` tracks whether any `text_delta` has been observed in the
+/// current assistant turn. The `assistant` snapshot branch uses it to avoid
+/// re-emitting text that was already streamed token-by-token. It resets to
+/// `false` after each `assistant` snapshot so the next turn starts clean.
+fn parse_stream_events(line: &str, seen_text_delta: &mut bool) -> Vec<StreamEvent> {
     let event: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return vec![],
@@ -555,7 +561,10 @@ fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
                     let delta = &inner["delta"];
                     match delta["type"].as_str() {
                         Some("text_delta") => match delta["text"].as_str() {
-                            Some(t) if !t.is_empty() => vec![StreamEvent::Delta(t.to_string())],
+                            Some(t) if !t.is_empty() => {
+                                *seen_text_delta = true;
+                                vec![StreamEvent::Delta(t.to_string())]
+                            },
                             _ => vec![],
                         },
                         Some("thinking_delta") => match delta["thinking"].as_str() {
@@ -570,29 +579,63 @@ fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
                 _ => vec![],
             }
         },
-        // Complete assistant snapshot — emit ObservedToolStart for each tool_use block.
+        // Complete assistant snapshot — emit text (if not already streamed via
+        // text_delta) and ObservedToolStart for each tool_use block.
         "assistant" => {
             let content = match event["message"]["content"].as_array() {
                 Some(c) => c,
                 None => return vec![],
             };
-            content
-                .iter()
-                .filter_map(|block| {
-                    if block["type"].as_str() == Some("tool_use") {
-                        let id = block["id"].as_str().unwrap_or("unknown").to_string();
-                        let name = block["name"].as_str().unwrap_or("unknown").to_string();
-                        let arguments = block["input"].clone();
-                        Some(StreamEvent::ObservedToolStart {
-                            id,
-                            name,
-                            arguments,
-                        })
+
+            let mut events = Vec::new();
+
+            // Extract text blocks only when no text_delta was streamed for this turn.
+            if !*seen_text_delta {
+                let full_text: String = content
+                    .iter()
+                    .filter_map(|block| {
+                        if block["type"].as_str() == Some("text") {
+                            block["text"].as_str()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+
+                if !full_text.is_empty() {
+                    if full_text.contains("Prompt is too long") {
+                        events.push(StreamEvent::Error(
+                            "Conversation exceeded model context window. \
+                             Run /compact or /new to continue."
+                                .to_string(),
+                        ));
                     } else {
-                        None
+                        events.push(StreamEvent::Delta(full_text));
                     }
-                })
-                .collect()
+                }
+            }
+
+            // Extract tool_use blocks (always).
+            events.extend(content.iter().filter_map(|block| {
+                if block["type"].as_str() == Some("tool_use") {
+                    let id = block["id"].as_str().unwrap_or("unknown").to_string();
+                    let name = block["name"].as_str().unwrap_or("unknown").to_string();
+                    let arguments = block["input"].clone();
+                    Some(StreamEvent::ObservedToolStart {
+                        id,
+                        name,
+                        arguments,
+                    })
+                } else {
+                    None
+                }
+            }));
+
+            // Reset for the next turn.
+            *seen_text_delta = false;
+
+            events
         },
         // Tool result — emit ObservedToolEnd for each tool_result in the message.
         "user" => {
@@ -849,6 +892,7 @@ impl LlmProvider for ClaudeCliProvider {
             let reader = tokio::io::BufReader::new(stdout);
             use tokio::io::AsyncBufReadExt;
             let mut lines = reader.lines();
+            let mut seen_text_delta = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim().to_string();
@@ -858,7 +902,7 @@ impl LlmProvider for ClaudeCliProvider {
 
                 trace!(line = %line, "claude-cli stream line");
 
-                for event in parse_stream_events(&line) {
+                for event in parse_stream_events(&line, &mut seen_text_delta) {
                     match &event {
                         StreamEvent::Error(_) => {
                             self.clear_session();
@@ -971,7 +1015,7 @@ mod tests {
     #[test]
     fn parse_text_delta() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::Delta(t) if t == "hello"));
     }
@@ -979,7 +1023,7 @@ mod tests {
     #[test]
     fn parse_thinking_delta() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me check"}}}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "Let me check"));
     }
@@ -987,7 +1031,7 @@ mod tests {
     #[test]
     fn parse_observed_tool_start_from_assistant() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls -la"}}]}}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::ObservedToolStart {
@@ -1006,7 +1050,7 @@ mod tests {
     #[test]
     fn parse_multiple_tool_uses_from_assistant() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"TODO"}}]}}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 2);
         assert!(
             matches!(&events[0], StreamEvent::ObservedToolStart { name, .. } if name == "Read")
@@ -1019,7 +1063,7 @@ mod tests {
     #[test]
     fn parse_observed_tool_end_from_user() {
         let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file1.txt\nfile2.txt"}]},"tool_use_result":"file1.txt\nfile2.txt"}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::ObservedToolEnd {
@@ -1038,7 +1082,7 @@ mod tests {
     #[test]
     fn parse_observed_tool_end_error() {
         let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Permission denied"}]},"tool_use_result":"Permission denied"}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::ObservedToolEnd { is_error, .. } => assert!(is_error),
@@ -1049,26 +1093,81 @@ mod tests {
     #[test]
     fn parse_content_block_start_tool_ignored() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}}}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
     fn parse_input_json_delta_ignored() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
-    fn parse_assistant_text_only_ignored() {
+    fn parse_assistant_text_emitted_when_no_delta_seen() {
         let line =
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#;
-        assert!(parse_stream_events(line).is_empty());
+        let events = parse_stream_events(line, &mut false);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::Delta(t) if t == "Hello world"));
+    }
+
+    #[test]
+    fn parse_assistant_text_skipped_when_delta_already_seen() {
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#;
+        let events = parse_stream_events(line, &mut true);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_assistant_prompt_too_long_emits_error() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long"}]}}"#;
+        let events = parse_stream_events(line, &mut false);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::Error(msg) if msg.contains("context window")));
+    }
+
+    #[test]
+    fn parse_assistant_prompt_too_long_skipped_when_delta_seen() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long"}]}}"#;
+        let events = parse_stream_events(line, &mut true);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_assistant_text_and_tools() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll check that"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}}]}}"#;
+        let events = parse_stream_events(line, &mut false);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::Delta(t) if t == "I'll check that"));
+        assert!(
+            matches!(&events[1], StreamEvent::ObservedToolStart { name, .. } if name == "Read")
+        );
+    }
+
+    #[test]
+    fn parse_assistant_resets_seen_text_delta() {
+        let mut seen = true;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
+        let _ = parse_stream_events(line, &mut seen);
+        assert!(
+            !seen,
+            "assistant snapshot should reset seen_text_delta for next turn"
+        );
+    }
+
+    #[test]
+    fn text_delta_sets_seen_flag() {
+        let mut seen = false;
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}}"#;
+        let _ = parse_stream_events(line, &mut seen);
+        assert!(seen, "text_delta should set seen_text_delta");
     }
 
     #[test]
     fn parse_result_success() {
         let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.01,"duration_ms":5000,"num_turns":3,"usage":{"input_tokens":100,"output_tokens":50}}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::Done(usage) => {
@@ -1082,7 +1181,7 @@ mod tests {
     #[test]
     fn parse_result_error() {
         let line = r#"{"type":"result","subtype":"error_max_budget_usd"}"#;
-        let events = parse_stream_events(line);
+        let events = parse_stream_events(line, &mut false);
         assert_eq!(events.len(), 1);
         assert!(
             matches!(&events[0], StreamEvent::Error(msg) if msg.contains("error_max_budget_usd"))
@@ -1093,36 +1192,36 @@ mod tests {
     fn parse_system_event_ignored() {
         let line =
             r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-sonnet-4-6"}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
     fn parse_invalid_json() {
-        assert!(parse_stream_events("not json at all").is_empty());
+        assert!(parse_stream_events("not json at all", &mut false).is_empty());
     }
 
     #[test]
     fn parse_empty_text_delta_ignored() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
     fn parse_message_start_ignored() {
         let line = r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-sonnet-4-6","id":"msg_01"}}}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
     fn parse_content_block_start_text_ignored() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
     fn parse_user_no_tool_result_ignored() {
         let line = r#"{"type":"user","message":{"content":[]},"tool_use_result":null}"#;
-        assert!(parse_stream_events(line).is_empty());
+        assert!(parse_stream_events(line, &mut false).is_empty());
     }
 
     #[test]
@@ -1131,7 +1230,7 @@ mod tests {
         let line = format!(
             r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1"}}]}},"tool_use_result":"{long_result}"}}"#
         );
-        let events = parse_stream_events(&line);
+        let events = parse_stream_events(&line, &mut false);
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::ObservedToolEnd { result, .. } => {

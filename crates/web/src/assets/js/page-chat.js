@@ -343,7 +343,7 @@ function renderContextMcpSection(card, data) {
 				dot.style.background = "var(--ok)";
 				tag.appendChild(dot);
 				tag.appendChild(document.createTextNode(s.name));
-				tag.title = `${s.tool_count} tool${s.tool_count !== 1 ? "s" : ""} — ${s.state}`;
+				tag.title = `${s.tool_count} tool${s.tool_count === 1 ? "" : "s"} — ${s.state}`;
 				wrap.appendChild(tag);
 			});
 			section.appendChild(wrap);
@@ -862,7 +862,7 @@ function handleSlashCommand(cmdName, cmdArgs) {
 
 // ── Build chat params (text-only or multimodal) ─────────
 function buildChatMessage(text, seq, displayText) {
-	var userText = displayText !== undefined ? displayText : text;
+	var userText = displayText === undefined ? text : displayText;
 	var images = hasPendingImages() ? getPendingImages() : [];
 	if (images.length > 0) {
 		var content = [];

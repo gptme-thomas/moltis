@@ -106,13 +106,10 @@ impl ClaudeCliProvider {
                     warn!("context_command produced no output");
                     None
                 } else {
-                    info!(
-                        len = text.len(),
-                        "context_command produced dynamic context"
-                    );
+                    info!(len = text.len(), "context_command produced dynamic context");
                     Some(text)
                 }
-            }
+            },
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 warn!(
@@ -121,19 +118,20 @@ impl ClaudeCliProvider {
                     "context_command failed"
                 );
                 None
-            }
+            },
             Err(e) => {
                 warn!(error = %e, "failed to run context_command");
                 None
-            }
+            },
         }
     }
 
     /// Build CLI arguments and prompt for a `claude --print` invocation,
     /// handling session resume for multi-turn conversations and tool loops.
     ///
-    /// Returns `(args, prompt_text)` where `args` includes the prompt as
-    /// the last positional argument.
+    /// Returns `(args, prompt_text)` where the prompt is **not** included
+    /// in `args` — callers must deliver it via stdin to avoid hitting
+    /// Linux's 128 KB per-argument limit (MAX_ARG_STRLEN / E2BIG).
     ///
     /// - **Resume** (active session exists): uses `--resume`, sends only the
     ///   new content — tool results or the latest user message.
@@ -220,7 +218,6 @@ impl ClaudeCliProvider {
                 .last_seen_msg_count
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = messages.len();
-            args.push(prompt.clone());
             return (args, prompt);
         }
 
@@ -278,7 +275,6 @@ impl ClaudeCliProvider {
             "claude-cli: starting fresh session"
         );
 
-        args.push(prompt.clone());
         (args, prompt)
     }
 
@@ -381,12 +377,7 @@ Assistant: Let me search your memory for health-related information.\n\
 
 /// Claude Code built-in tools that overlap with Moltis tools or are otherwise
 /// inappropriate when running inside Moltis (e.g. interactive-only tools).
-const DISALLOWED_TOOLS: &[&str] = &[
-    "Bash",
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
-];
+const DISALLOWED_TOOLS: &[&str] = &["Bash", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"];
 
 /// Adapt the generic Moltis system prompt for use as a Claude CLI addendum.
 ///
@@ -563,19 +554,15 @@ fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
                 "content_block_delta" => {
                     let delta = &inner["delta"];
                     match delta["type"].as_str() {
-                        Some("text_delta") => {
-                            match delta["text"].as_str() {
-                                Some(t) if !t.is_empty() => vec![StreamEvent::Delta(t.to_string())],
-                                _ => vec![],
-                            }
+                        Some("text_delta") => match delta["text"].as_str() {
+                            Some(t) if !t.is_empty() => vec![StreamEvent::Delta(t.to_string())],
+                            _ => vec![],
                         },
-                        Some("thinking_delta") => {
-                            match delta["thinking"].as_str() {
-                                Some(t) if !t.is_empty() => {
-                                    vec![StreamEvent::ReasoningDelta(t.to_string())]
-                                },
-                                _ => vec![],
-                            }
+                        Some("thinking_delta") => match delta["thinking"].as_str() {
+                            Some(t) if !t.is_empty() => {
+                                vec![StreamEvent::ReasoningDelta(t.to_string())]
+                            },
+                            _ => vec![],
                         },
                         _ => vec![],
                     }
@@ -654,12 +641,8 @@ fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
             let is_success = event["subtype"].as_str() == Some("success");
             if is_success {
                 let usage = Usage {
-                    input_tokens: event["usage"]["input_tokens"]
-                        .as_u64()
-                        .unwrap_or(0) as u32,
-                    output_tokens: event["usage"]["output_tokens"]
-                        .as_u64()
-                        .unwrap_or(0) as u32,
+                    input_tokens: event["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32,
+                    output_tokens: event["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32,
                     ..Usage::default()
                 };
                 vec![StreamEvent::Done(usage)]
@@ -671,6 +654,19 @@ fn parse_stream_events(line: &str) -> Vec<StreamEvent> {
             }
         },
         _ => vec![],
+    }
+}
+
+fn friendly_spawn_error(e: &std::io::Error, prompt_len: usize) -> anyhow::Error {
+    if e.raw_os_error() == Some(7) || e.to_string().contains("Argument list too long") {
+        anyhow::anyhow!(
+            "Conversation too large to send ({:.0} KB in argv). \
+             Run /compact to shrink context, or /new to start fresh. \
+             (OS error: {e})",
+            prompt_len as f64 / 1024.0,
+        )
+    } else {
+        anyhow::anyhow!("failed to spawn claude CLI: {e}")
     }
 }
 
@@ -715,14 +711,32 @@ impl LlmProvider for ClaudeCliProvider {
         let mut cmd = tokio::process::Command::new(&self.claude_binary);
         cmd.args(&args)
             .env_remove("CLAUDECODE")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if let Some(ref dir) = self.working_dir {
             cmd.current_dir(dir);
         }
-        let output = cmd.spawn()?
-            .wait_with_output()
-            .await?;
+        let mut child = cmd.spawn().map_err(|e| {
+            self.clear_session();
+            friendly_spawn_error(&e, prompt.len())
+        })?;
+
+        // Deliver the prompt via stdin to avoid Linux's 128 KB
+        // per-argument limit (MAX_ARG_STRLEN).
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("stdin was not piped on spawned claude CLI"))?;
+            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
+                self.clear_session();
+                anyhow::anyhow!("failed to write prompt to claude CLI stdin: {e}")
+            })?;
+        }
+
+        let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -788,20 +802,40 @@ impl LlmProvider for ClaudeCliProvider {
             let mut cmd = tokio::process::Command::new(&self.claude_binary);
             cmd.args(&args)
                 .env_remove("CLAUDECODE")
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             if let Some(ref dir) = self.working_dir {
                 cmd.current_dir(dir);
             }
-            let child = match cmd.spawn()
+            let mut child = match cmd.spawn()
             {
                 Ok(child) => child,
                 Err(e) => {
                     self.clear_session();
-                    yield StreamEvent::Error(format!("failed to spawn claude CLI: {e}"));
+                    yield StreamEvent::Error(friendly_spawn_error(&e, prompt.len()).to_string());
                     return;
                 }
             };
+
+            // Deliver the prompt via stdin to avoid Linux's 128 KB
+            // per-argument limit (MAX_ARG_STRLEN).
+            {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = match child.stdin.take() {
+                    Some(s) => s,
+                    None => {
+                        self.clear_session();
+                        yield StreamEvent::Error("claude CLI stdin not captured".into());
+                        return;
+                    }
+                };
+                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                    self.clear_session();
+                    yield StreamEvent::Error(format!("failed to write prompt to claude CLI stdin: {e}"));
+                    return;
+                }
+            }
 
             let stdout = match child.stdout {
                 Some(stdout) => stdout,
@@ -956,7 +990,11 @@ mod tests {
         let events = parse_stream_events(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::ObservedToolStart { id, name, arguments } => {
+            StreamEvent::ObservedToolStart {
+                id,
+                name,
+                arguments,
+            } => {
                 assert_eq!(id, "toolu_01");
                 assert_eq!(name, "Bash");
                 assert_eq!(arguments["command"], "ls -la");
@@ -970,8 +1008,12 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"TODO"}}]}}"#;
         let events = parse_stream_events(line);
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], StreamEvent::ObservedToolStart { name, .. } if name == "Read"));
-        assert!(matches!(&events[1], StreamEvent::ObservedToolStart { name, .. } if name == "Grep"));
+        assert!(
+            matches!(&events[0], StreamEvent::ObservedToolStart { name, .. } if name == "Read")
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::ObservedToolStart { name, .. } if name == "Grep")
+        );
     }
 
     #[test]
@@ -980,7 +1022,11 @@ mod tests {
         let events = parse_stream_events(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::ObservedToolEnd { id, result, is_error } => {
+            StreamEvent::ObservedToolEnd {
+                id,
+                result,
+                is_error,
+            } => {
                 assert_eq!(id, "toolu_01");
                 assert!(!is_error);
                 assert!(result.as_ref().unwrap().contains("file1.txt"));
@@ -1038,7 +1084,9 @@ mod tests {
         let line = r#"{"type":"result","subtype":"error_max_budget_usd"}"#;
         let events = parse_stream_events(line);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], StreamEvent::Error(msg) if msg.contains("error_max_budget_usd")));
+        assert!(
+            matches!(&events[0], StreamEvent::Error(msg) if msg.contains("error_max_budget_usd"))
+        );
     }
 
     #[test]
@@ -1428,11 +1476,90 @@ mod tests {
         assert_eq!(prompt, "Describe this");
     }
 
+    // ── stdin prompt delivery (argv stays small) ──────────────────────
+
+    #[test]
+    fn prompt_not_in_argv() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let messages = vec![ChatMessage::user("Hello world")];
+        let (args, prompt) = provider.build_session_args(&messages, "json");
+
+        assert_eq!(prompt, "Hello world");
+        assert!(
+            !args.contains(&"Hello world".to_string()),
+            "prompt must not appear in argv — it goes via stdin"
+        );
+    }
+
+    #[test]
+    fn large_prompt_not_in_argv() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let big = "x".repeat(200_000);
+        let messages = vec![ChatMessage::user(&big)];
+        let (args, prompt) = provider.build_session_args(&messages, "stream-json");
+
+        assert_eq!(prompt.len(), 200_000);
+        let argv_bytes: usize = args.iter().map(|a| a.len()).sum();
+        assert!(
+            argv_bytes < 10_000,
+            "argv should be small (flags only), got {argv_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn resume_prompt_not_in_argv() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+
+        let messages_2 = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi!"),
+            ChatMessage::user("Follow-up question with details"),
+        ];
+        let (args, prompt) = provider.build_session_args(&messages_2, "json");
+
+        assert_eq!(prompt, "Follow-up question with details");
+        assert!(
+            !args.contains(&prompt),
+            "resume prompt must not appear in argv"
+        );
+    }
+
+    // ── friendly_spawn_error ────────────────────────────────────────────
+
+    #[test]
+    fn e2big_error_gives_friendly_message() {
+        let io_err = std::io::Error::from_raw_os_error(7); // E2BIG
+        let friendly = friendly_spawn_error(&io_err, 140_000);
+        let msg = friendly.to_string();
+        assert!(msg.contains("/compact"), "should suggest /compact: {msg}");
+        assert!(msg.contains("/new"), "should suggest /new: {msg}");
+        assert!(msg.contains("137"), "should show size in KB: {msg}");
+    }
+
+    #[test]
+    fn non_e2big_error_uses_generic_message() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file");
+        let friendly = friendly_spawn_error(&io_err, 1000);
+        let msg = friendly.to_string();
+        assert!(
+            msg.contains("failed to spawn claude CLI"),
+            "should use generic prefix: {msg}"
+        );
+        assert!(
+            !msg.contains("/compact"),
+            "should not suggest /compact: {msg}"
+        );
+    }
+
     // ── adapt_system_prompt_for_cli ───────────────────────────────────
 
     #[test]
     fn adapt_strips_generic_intro() {
-        let input = "You are a helpful assistant. You can use tools when needed.\n\nSome context.\n";
+        let input =
+            "You are a helpful assistant. You can use tools when needed.\n\nSome context.\n";
         let adapted = adapt_system_prompt_for_cli(input);
         assert!(!adapted.contains("You are a helpful assistant"));
         assert!(adapted.contains("Moltis platform"));
@@ -1485,7 +1612,8 @@ Be concise.\n";
 
     #[test]
     fn adapt_preserves_passthrough_content() {
-        let input = "## Runtime\n\nHost: data_dir=/home/user/.moltis\n\n## Guidelines\n\nBe helpful.\n";
+        let input =
+            "## Runtime\n\nHost: data_dir=/home/user/.moltis\n\n## Guidelines\n\nBe helpful.\n";
         let adapted = adapt_system_prompt_for_cli(input);
         assert!(adapted.contains("## Runtime"));
         assert!(adapted.contains("Host: data_dir=/home/user/.moltis"));
@@ -1601,7 +1729,9 @@ The current date and time is Saturday, 2026-03-08 05:30 UTC.
 "#;
         let adapted = adapt_system_prompt_for_cli(input);
         std::fs::write("/tmp/claude-cli-system-prompt.txt", &adapted).unwrap();
-        println!("Wrote {} bytes to /tmp/claude-cli-system-prompt.txt", adapted.len());
+        println!(
+            "Wrote {} bytes to /tmp/claude-cli-system-prompt.txt",
+            adapted.len()
+        );
     }
-
 }

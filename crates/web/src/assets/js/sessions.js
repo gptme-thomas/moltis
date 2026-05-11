@@ -150,7 +150,7 @@ function mergeSessionListPage(existingSessions, incomingSessions, append) {
 	}
 
 	function withLocalFlags(session) {
-		if (!(session && session.key)) return session;
+		if (!session?.key) return session;
 		var prev = oldByKey[session.key];
 		if (!prev) return session;
 		var merged = { ...session };
@@ -173,7 +173,7 @@ function mergeSessionListPage(existingSessions, incomingSessions, append) {
 	}
 
 	for (var session of incoming) {
-		if (!(session && session.key)) continue;
+		if (!session?.key) continue;
 		var next = withLocalFlags(session);
 		var idx = indexByKey[session.key];
 		if (Number.isInteger(idx)) {
@@ -561,7 +561,7 @@ export function clearAllSessions() {
 		return Promise.resolve({ ok: true, skipped: true });
 	}
 	return confirmDialog(
-		`Delete ${count} session${count !== 1 ? "s" : ""}? Main, channel-bound, and cron sessions will be kept.`,
+		`Delete ${count} session${count === 1 ? "" : "s"}? Main, channel-bound, and cron sessions will be kept.`,
 	).then((yes) => {
 		if (!yes) return { ok: false, cancelled: true };
 		return sendRpc("sessions.clear_all", {}).then((res) => {
@@ -950,7 +950,7 @@ function mergeHistoryPages(existingHistory, olderHistory) {
 
 function canLoadOlderHistory(key) {
 	var paging = getHistoryPaginationState(key);
-	if (!(paging && paging.hasMore && Number.isInteger(paging.nextCursor))) return false;
+	if (!(paging?.hasMore && Number.isInteger(paging.nextCursor))) return false;
 	if (paging.loadingOlder) return false;
 	return true;
 }

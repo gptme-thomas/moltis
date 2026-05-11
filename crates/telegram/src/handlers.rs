@@ -786,16 +786,8 @@ pub async fn handle_message_direct(
 
 fn should_intercept_slash_command(cmd: &str, cmd_text: &str) -> bool {
     match cmd {
-        "new"
-        | "clear"
-        | "compact"
-        | "context"
-        | "model"
-        | "sandbox"
-        | "approval"
-        | "sessions"
-        | "agent"
-        | "help" => true,
+        "new" | "clear" | "compact" | "context" | "model" | "sandbox" | "approval" | "sessions"
+        | "agent" | "help" => true,
         "sh" => {
             let args = cmd_text.strip_prefix(cmd).unwrap_or("").trim();
             args.is_empty() || matches!(args, "on" | "off" | "exit" | "status")
@@ -2180,8 +2172,14 @@ mod tests {
     fn approval_command_is_intercepted() {
         assert!(should_intercept_slash_command("approval", "approval"));
         assert!(should_intercept_slash_command("approval", "approval off"));
-        assert!(should_intercept_slash_command("approval", "approval on-miss"));
-        assert!(should_intercept_slash_command("approval", "approval always"));
+        assert!(should_intercept_slash_command(
+            "approval",
+            "approval on-miss"
+        ));
+        assert!(should_intercept_slash_command(
+            "approval",
+            "approval always"
+        ));
         assert!(should_intercept_slash_command("approval", "approval clear"));
     }
 

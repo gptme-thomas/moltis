@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use {
+    serde::{Deserialize, Serialize},
+    tracing::{info, warn},
+};
 
 /// A project represents a codebase directory that moltis can work with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,7 +165,7 @@ impl ProjectContext {
                     );
                     Some(text)
                 }
-            }
+            },
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 warn!(
@@ -173,7 +175,7 @@ impl ProjectContext {
                     "context_command failed"
                 );
                 None
-            }
+            },
             Err(e) => {
                 warn!(
                     project = %self.project.label,
@@ -181,7 +183,7 @@ impl ProjectContext {
                     "failed to run context_command"
                 );
                 None
-            }
+            },
         }
     }
 }

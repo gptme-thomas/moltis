@@ -25,7 +25,7 @@ export class Session {
 		this.sandbox_image = serverData.sandbox_image || null;
 		this.channelBinding = serverData.channelBinding || null;
 		this.parentSessionKey = serverData.parentSessionKey || "";
-		this.forkPoint = serverData.forkPoint != null ? serverData.forkPoint : null;
+		this.forkPoint = serverData.forkPoint == null ? null : serverData.forkPoint;
 		this.agent_id = serverData.agent_id || "main";
 		this.node_id = serverData.node_id || null;
 		this.mcpDisabled = serverData.mcpDisabled;
@@ -81,7 +81,7 @@ export class Session {
 		this.sandbox_image = serverData.sandbox_image || null;
 		this.channelBinding = serverData.channelBinding || null;
 		this.parentSessionKey = serverData.parentSessionKey || "";
-		this.forkPoint = serverData.forkPoint != null ? serverData.forkPoint : null;
+		this.forkPoint = serverData.forkPoint == null ? null : serverData.forkPoint;
 		this.agent_id = serverData.agent_id || "main";
 		this.node_id = serverData.node_id || null;
 		this.mcpDisabled = serverData.mcpDisabled;

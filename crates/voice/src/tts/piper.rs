@@ -63,13 +63,19 @@ impl PiperTts {
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
-            "-f", "s16le",   // raw PCM input
-            "-ar", "22050",  // sample rate
-            "-ac", "1",      // mono
-            "-i", "pipe:0",  // read from stdin
-            "-c:a", ffmpeg_codec,
-            "-f", ffmpeg_format,
-            "pipe:1",        // write to stdout
+            "-f",
+            "s16le", // raw PCM input
+            "-ar",
+            "22050", // sample rate
+            "-ac",
+            "1", // mono
+            "-i",
+            "pipe:0", // read from stdin
+            "-c:a",
+            ffmpeg_codec,
+            "-f",
+            ffmpeg_format,
+            "pipe:1", // write to stdout
         ]);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -199,7 +205,7 @@ impl TtsProvider for PiperTts {
             target => {
                 let converted = Self::convert_pcm_via_ffmpeg(&raw_pcm, target).await?;
                 (converted, target)
-            }
+            },
         };
 
         Ok(AudioOutput {

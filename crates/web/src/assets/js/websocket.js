@@ -302,7 +302,7 @@ function appendToolResult(toolCard, result, eventSession) {
 }
 
 function isToolValidationErrorPayload(p) {
-	if (!(p && !p.success && p.error && p.error.detail)) return false;
+	if (!(p && !p.success && p.error?.detail)) return false;
 	var errDetail = p.error.detail.toLowerCase();
 	return (
 		errDetail.includes("missing field") ||
@@ -807,7 +807,7 @@ function handleChatError(p, isActive, isChatPage, eventSession) {
 			var btn = document.createElement("button");
 			btn.className = "provider-btn error-continue-btn";
 			btn.textContent = t("errors:chat.continue", "Continue");
-			btn.onclick = function () {
+			btn.onclick = () => {
 				btn.disabled = true;
 				btn.textContent = t("errors:chat.continuing", "Continuing...");
 				S.chatInput.value = t("errors:chat.continueMessage", "Please continue where you left off.");
@@ -1217,11 +1217,11 @@ function handleLocalLlmDownload(payload) {
 
 	if (payload.downloaded != null && textEl) {
 		var downloadedMb = (payload.downloaded / (1024 * 1024)).toFixed(1);
-		if (payload.total != null) {
+		if (payload.total == null) {
+			textEl.textContent = `${downloadedMb} MB`;
+		} else {
 			var totalMb = (payload.total / (1024 * 1024)).toFixed(1);
 			textEl.textContent = `${downloadedMb} / ${totalMb} MB`;
-		} else {
-			textEl.textContent = `${downloadedMb} MB`;
 		}
 	}
 }

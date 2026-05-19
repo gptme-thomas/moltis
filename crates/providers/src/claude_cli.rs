@@ -11,11 +11,7 @@
 //! needed) and Claude Code's built-in agent capabilities. It is **not** suitable
 //! for Moltis-native tool calling since the subprocess runs its own agent loop.
 
-use std::{
-    path::PathBuf,
-    pin::Pin,
-    sync::Mutex,
-};
+use std::{path::PathBuf, pin::Pin, sync::Mutex};
 
 use {async_trait::async_trait, tokio_stream::Stream, uuid::Uuid};
 
@@ -114,10 +110,10 @@ impl ClaudeCliProvider {
                 } else {
                     debug!(path = %path.display(), "persisted claude-cli session state");
                 }
-            }
+            },
             Err(e) => {
                 warn!(error = %e, "failed to serialize claude-cli session state");
-            }
+            },
         }
     }
 
@@ -137,7 +133,7 @@ impl ClaudeCliProvider {
             Err(e) => {
                 warn!(error = %e, path = %path.display(), "failed to parse persisted session state");
                 return;
-            }
+            },
         };
         if state["model"].as_str() != Some(&self.model) {
             debug!("persisted state is for a different model, ignoring");

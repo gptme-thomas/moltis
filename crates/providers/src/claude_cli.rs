@@ -11,7 +11,11 @@
 //! needed) and Claude Code's built-in agent capabilities. It is **not** suitable
 //! for Moltis-native tool calling since the subprocess runs its own agent loop.
 
-use std::{pin::Pin, sync::Mutex};
+use std::{
+    path::PathBuf,
+    pin::Pin,
+    sync::Mutex,
+};
 
 use {async_trait::async_trait, tokio_stream::Stream, uuid::Uuid};
 
@@ -43,6 +47,10 @@ pub struct ClaudeCliProvider {
     /// Used to detect when other providers have added messages (model switching)
     /// so we can clear the stale Claude CLI session and start fresh.
     last_seen_msg_count: Mutex<usize>,
+    /// Directory for persisting session state across gateway restarts.
+    /// When set, session UUID and message count are written to a JSON file
+    /// so the next gateway startup can resume the same claude-cli session.
+    state_dir: Option<PathBuf>,
 }
 
 impl ClaudeCliProvider {
@@ -56,6 +64,108 @@ impl ClaudeCliProvider {
             context_command: None,
             active_session: Mutex::new(None),
             last_seen_msg_count: Mutex::new(0),
+            state_dir: None,
+        }
+    }
+
+    /// Set the directory for persisting session state across restarts.
+    /// When set, calling `load_persisted_state()` on construction and
+    /// `persist_state()` after session changes enables restart-safe resume.
+    #[must_use]
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
+    }
+
+    /// File path for the persisted session state.
+    fn state_file_path(&self) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|dir| {
+            let safe_model = self.model.replace('/', "_");
+            dir.join(format!("claude-cli-session-{safe_model}.json"))
+        })
+    }
+
+    /// Persist current session state to disk so it survives gateway restarts.
+    fn persist_state(&self) {
+        let Some(path) = self.state_file_path() else {
+            return;
+        };
+        let uuid = self
+            .active_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let msg_count = *self
+            .last_seen_msg_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = serde_json::json!({
+            "session_uuid": uuid,
+            "msg_count": msg_count,
+            "model": self.model,
+        });
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_string_pretty(&state) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!(error = %e, path = %path.display(), "failed to persist claude-cli session state");
+                } else {
+                    debug!(path = %path.display(), "persisted claude-cli session state");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to serialize claude-cli session state");
+            }
+        }
+    }
+
+    /// Load previously persisted session state from disk.
+    /// Called during construction to restore session resume capability
+    /// after a gateway restart.
+    pub fn load_persisted_state(&self) {
+        let Some(path) = self.state_file_path() else {
+            return;
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let state: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "failed to parse persisted session state");
+                return;
+            }
+        };
+        if state["model"].as_str() != Some(&self.model) {
+            debug!("persisted state is for a different model, ignoring");
+            return;
+        }
+        if let Some(uuid) = state["session_uuid"].as_str() {
+            *self
+                .active_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(uuid.to_string());
+            if let Some(count) = state["msg_count"].as_u64() {
+                *self
+                    .last_seen_msg_count
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = count as usize;
+            }
+            info!(
+                session_uuid = %uuid,
+                path = %path.display(),
+                "restored claude-cli session state from disk"
+            );
+        }
+    }
+
+    /// Remove persisted state file (called on session clear).
+    fn clear_persisted_state(&self) {
+        if let Some(path) = self.state_file_path() {
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -218,6 +328,7 @@ impl ClaudeCliProvider {
                 .last_seen_msg_count
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = messages.len();
+            self.persist_state();
             return (args, prompt);
         }
 
@@ -239,6 +350,8 @@ impl ClaudeCliProvider {
             .last_seen_msg_count
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = messages.len();
+
+        self.persist_state();
 
         // Merge system prompts from struct config and from messages.
         let merged_system = match (&self.system_prompt, &extra_system) {
@@ -288,6 +401,7 @@ impl ClaudeCliProvider {
             .last_seen_msg_count
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = 0;
+        self.clear_persisted_state();
     }
 }
 
@@ -1717,6 +1831,95 @@ Be concise.\n";
         assert!(adapted.contains("## Runtime"));
         assert!(adapted.contains("Host: data_dir=/home/user/.moltis"));
         assert!(adapted.contains("## Guidelines"));
+    }
+
+    // ── Session state persistence ──────────────────────────────────
+
+    #[test]
+    fn persist_and_restore_session_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+
+        let messages = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages, "json");
+        let original_uuid = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Simulate gateway restart: create a new provider and load state.
+        let provider2 = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+        provider2.load_persisted_state();
+
+        let restored_uuid = provider2.active_session.lock().unwrap().clone().unwrap();
+        assert_eq!(original_uuid, restored_uuid);
+
+        let restored_count = *provider2.last_seen_msg_count.lock().unwrap();
+        assert_eq!(restored_count, 1);
+    }
+
+    #[test]
+    fn clear_session_removes_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+
+        let messages = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages, "json");
+        assert!(provider.state_file_path().unwrap().exists());
+
+        provider.clear_session();
+        assert!(!provider.state_file_path().unwrap().exists());
+    }
+
+    #[test]
+    fn restore_ignores_different_model() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let provider_a = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+        let messages = vec![ChatMessage::user("Hello")];
+        provider_a.build_session_args(&messages, "json");
+
+        // New provider with a different model should not restore the state.
+        let provider_b = ClaudeCliProvider::new("claude-opus-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+        provider_b.load_persisted_state();
+        assert!(provider_b.active_session.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_no_state_dir_is_noop() {
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into());
+        let messages = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages, "json");
+        // Should not panic or error — just silently skip persistence.
+        assert!(provider.active_session.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn resume_updates_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+
+        // First call: fresh session.
+        let messages_1 = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages_1, "json");
+
+        // Second call: resume with more messages.
+        let messages_2 = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there!"),
+            ChatMessage::user("Follow-up"),
+        ];
+        provider.build_session_args(&messages_2, "json");
+
+        // Restore in a new provider and verify updated msg_count.
+        let provider2 = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_state_dir(dir.path().to_path_buf());
+        provider2.load_persisted_state();
+        let restored_count = *provider2.last_seen_msg_count.lock().unwrap();
+        assert_eq!(restored_count, 3);
     }
 
     /// Dump a realistic adapted system prompt to `/tmp/claude-cli-system-prompt.txt`.

@@ -2755,10 +2755,12 @@ impl ProviderRegistry {
                 .with_binary(claude_binary.clone());
             if let Some(ref dir) = working_dir {
                 p = p.with_working_dir(dir.clone());
+                p = p.with_state_dir(std::path::PathBuf::from(dir));
             }
             if let Some(ref cmd) = context_command {
                 p = p.with_context_command(cmd.clone());
             }
+            p.load_persisted_state();
             let provider = Arc::new(p);
             self.register(
                 ModelInfo {

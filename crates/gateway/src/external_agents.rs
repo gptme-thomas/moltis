@@ -15,7 +15,7 @@ use {
     moltis_sessions::{MessageContent, PersistedMessage},
     serde_json::Value,
     tokio::sync::Mutex,
-    tracing::warn,
+    tracing::{info, warn},
 };
 
 use moltis_tools::approval::{ApprovalDecision, ApprovalManager};
@@ -450,6 +450,22 @@ impl ExternalAgentChatService {
             .and_then(|value| value.as_str())
             .ok_or_else(|| "external agents currently require text input".to_string())?
             .to_string();
+        let channel_reply_target = params
+            .get("_channel_reply_target")
+            .cloned()
+            .and_then(|value| {
+                match serde_json::from_value::<moltis_channels::ChannelReplyTarget>(value) {
+                    Ok(target) => Some(target),
+                    Err(error) => {
+                        warn!(
+                            session = %session_key,
+                            %error,
+                            "ignoring invalid external-agent channel reply target"
+                        );
+                        None
+                    },
+                }
+            });
         let seq = params.get("_seq").and_then(|value| value.as_u64());
         let run_id = uuid::Uuid::new_v4().to_string();
         let created_at = now_ms();
@@ -491,8 +507,21 @@ impl ExternalAgentChatService {
         )
         .await;
 
-        let context = context_from_history(&history);
+        let context_command_output = moltis_common::context_command::run_context_command(
+            self.state.config.chat.context_command.as_deref(),
+            None,
+        )
+        .await;
+        let context = context_from_history_with_project_context(&history, context_command_output);
         let start = std::time::Instant::now();
+        info!(
+            session = %session_key,
+            kind = kind.as_str(),
+            run_id,
+            text_len = text.len(),
+            channel_reply = channel_reply_target.is_some(),
+            "external-agent turn starting"
+        );
         let live_session = self
             .external_agents
             .session_for_binding(&session_key, kind)
@@ -621,7 +650,65 @@ impl ExternalAgentChatService {
             BroadcastOpts::default(),
         )
         .await;
+        deliver_external_agent_channel_reply(
+            &self.state,
+            channel_reply_target,
+            &assistant_text,
+            &session_key,
+        )
+        .await;
+        info!(
+            session = %session_key,
+            kind = kind.as_str(),
+            run_id,
+            text_len = assistant_text.len(),
+            duration_ms,
+            "external-agent turn completed"
+        );
         Ok(serde_json::json!({ "ok": true, "runId": run_id }))
+    }
+}
+
+async fn deliver_external_agent_channel_reply(
+    state: &GatewayState,
+    target: Option<moltis_channels::ChannelReplyTarget>,
+    text: &str,
+    session_key: &str,
+) {
+    let Some(target) = target else {
+        return;
+    };
+    if text.trim().is_empty() {
+        info!(
+            session_key,
+            account_id = target.account_id,
+            chat_id = target.chat_id,
+            "external-agent channel reply skipped: empty response text"
+        );
+        return;
+    }
+    let Some(outbound) = state.services.channel_outbound_arc() else {
+        warn!(
+            session_key,
+            account_id = target.account_id,
+            chat_id = target.chat_id,
+            "external-agent channel reply skipped: outbound unavailable"
+        );
+        return;
+    };
+    let to = target.outbound_to().into_owned();
+    if let Err(error) = outbound
+        .send_text(&target.account_id, &to, text, target.message_id.as_deref())
+        .await
+    {
+        warn!(
+            session_key,
+            account_id = target.account_id,
+            chat_id = target.chat_id,
+            thread_id = target.thread_id.as_deref().unwrap_or("-"),
+            %error,
+            "external-agent channel reply failed"
+        );
     }
 }
 
@@ -727,7 +814,10 @@ async fn resolve_session_key(params: &Value, state: &GatewayState) -> String {
     "main".to_string()
 }
 
-fn context_from_history(history: &[Value]) -> ContextSnapshot {
+fn context_from_history_with_project_context(
+    history: &[Value],
+    project_context: Option<String>,
+) -> ContextSnapshot {
     let recent_turns = history
         .iter()
         .rev()
@@ -754,6 +844,7 @@ fn context_from_history(history: &[Value]) -> ContextSnapshot {
         .collect();
     ContextSnapshot {
         recent_turns,
+        project_context,
         ..ContextSnapshot::default()
     }
 }
@@ -912,6 +1003,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_from_history_includes_project_context() {
+        let history = vec![
+            PersistedMessage::User {
+                content: MessageContent::Text("hello".to_string()),
+                created_at: None,
+                audio: None,
+                documents: None,
+                channel: None,
+                seq: None,
+                run_id: None,
+            }
+            .to_value(),
+        ];
+
+        let context =
+            context_from_history_with_project_context(&history, Some("dynamic context".into()));
+
+        assert_eq!(context.project_context.as_deref(), Some("dynamic context"));
+        assert_eq!(context.recent_turns.len(), 1);
+    }
+
     async fn sqlite_pool() -> sqlx::SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         moltis_projects::run_migrations(&pool).await.unwrap();
@@ -946,13 +1059,17 @@ mod tests {
     }
 
     fn test_gateway_state() -> Arc<GatewayState> {
+        test_gateway_state_with_services(GatewayServices::noop())
+    }
+
+    fn test_gateway_state_with_services(services: GatewayServices) -> Arc<GatewayState> {
         GatewayState::new(
             ResolvedAuth {
                 mode: AuthMode::Token,
                 token: None,
                 password: None,
             },
-            GatewayServices::noop(),
+            services,
         )
     }
 
@@ -965,6 +1082,55 @@ mod tests {
             Arc::new(NoopChatService),
             external_agents,
             test_gateway_state(),
+            session_store,
+            metadata,
+        )
+    }
+
+    #[derive(Default)]
+    struct RecordingOutbound {
+        messages: Mutex<Vec<(String, String, String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl moltis_channels::ChannelOutbound for RecordingOutbound {
+        async fn send_text(
+            &self,
+            account_id: &str,
+            to: &str,
+            text: &str,
+            reply_to: Option<&str>,
+        ) -> moltis_channels::Result<()> {
+            self.messages.lock().await.push((
+                account_id.to_string(),
+                to.to_string(),
+                text.to_string(),
+                reply_to.map(ToOwned::to_owned),
+            ));
+            Ok(())
+        }
+
+        async fn send_media(
+            &self,
+            _account_id: &str,
+            _to: &str,
+            _payload: &moltis_common::types::ReplyPayload,
+            _reply_to: Option<&str>,
+        ) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn test_chat_service_with_state(
+        external_agents: Arc<GatewayExternalAgentService>,
+        metadata: Arc<SqliteSessionMetadata>,
+        session_store: Arc<SessionStore>,
+        state: Arc<GatewayState>,
+    ) -> ExternalAgentChatService {
+        ExternalAgentChatService::new(
+            Arc::new(NoopChatService),
+            external_agents,
+            state,
             session_store,
             metadata,
         )
@@ -1129,6 +1295,51 @@ mod tests {
                 .and_then(|entry| entry.external_session_id),
             Some("fake-session-1".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn bound_chat_send_delivers_external_reply_to_channel_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let metadata = Arc::new(SqliteSessionMetadata::new(sqlite_pool().await));
+        let agent_state = Arc::new(FakeAgentState::default());
+        let external_agents = fake_external_agents(Arc::clone(&metadata), Arc::clone(&agent_state));
+        external_agents
+            .bind(serde_json::json!({ "sessionKey": "telegram:bot:123", "kind": "codex" }))
+            .await
+            .expect("bind external agent");
+        let outbound = Arc::new(RecordingOutbound::default());
+        let state = test_gateway_state_with_services(
+            GatewayServices::noop().with_channel_outbound(outbound.clone()),
+        );
+        let chat = test_chat_service_with_state(
+            Arc::clone(&external_agents),
+            Arc::clone(&metadata),
+            Arc::clone(&session_store),
+            state,
+        )
+        .await;
+
+        chat.send(serde_json::json!({
+            "sessionKey": "telegram:bot:123",
+            "text": "hello",
+            "_channel_reply_target": {
+                "channel_type": "telegram",
+                "account_id": "bot",
+                "chat_id": "123",
+                "message_id": "456",
+                "thread_id": null,
+            },
+        }))
+        .await
+        .expect("send external agent turn");
+
+        assert_eq!(*outbound.messages.lock().await, vec![(
+            "bot".to_string(),
+            "123".to_string(),
+            "reply to hello".to_string(),
+            Some("456".to_string()),
+        )]);
     }
 
     #[tokio::test]

@@ -2755,8 +2755,11 @@ impl ProviderRegistry {
                 .with_binary(claude_binary.clone());
             if let Some(ref dir) = working_dir {
                 p = p.with_working_dir(dir.clone());
-                p = p.with_state_dir(std::path::PathBuf::from(dir));
             }
+            // Session persistence is independent of `working_dir`: the whole
+            // point of the feature is surviving restarts, so it must not be
+            // silently disabled just because no working directory is set.
+            p = p.with_state_dir(claude_cli::ClaudeCliProvider::default_state_dir());
             if let Some(ref cmd) = context_command {
                 p = p.with_context_command(cmd.clone());
             }

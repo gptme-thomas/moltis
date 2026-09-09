@@ -64,6 +64,16 @@ impl ClaudeCliProvider {
         }
     }
 
+    /// Default directory for persisted session state: `data_dir()/claude-cli`.
+    ///
+    /// This is gateway-local state, so it belongs in Moltis' own data
+    /// directory rather than in the user's project working directory (where
+    /// it would show up in `git status` and be liable to get committed).
+    #[must_use]
+    pub fn default_state_dir() -> PathBuf {
+        moltis_config::data_dir().join("claude-cli")
+    }
+
     /// Set the directory for persisting session state across restarts.
     /// When set, calling `load_persisted_state()` on construction and
     /// `persist_state()` after session changes enables restart-safe resume.
@@ -73,17 +83,44 @@ impl ClaudeCliProvider {
         self
     }
 
+    /// Stable 64-bit FNV-1a hash, used to scope state files by working
+    /// directory. Deliberately not `DefaultHasher`: that is not guaranteed
+    /// stable across Rust releases, and a changed hash would silently orphan
+    /// every persisted session.
+    fn path_hash(s: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
     /// File path for the persisted session state.
+    ///
+    /// The file name is scoped by both model and working directory, because
+    /// the state directory is shared across every claude-cli provider on the
+    /// host: two gateways pointed at different projects must not collide.
     fn state_file_path(&self) -> Option<PathBuf> {
         self.state_dir.as_ref().map(|dir| {
             let safe_model = self.model.replace('/', "_");
-            dir.join(format!("claude-cli-session-{safe_model}.json"))
+            match self.working_dir.as_deref() {
+                Some(wd) => {
+                    let scope = Self::path_hash(wd);
+                    dir.join(format!("claude-cli-session-{safe_model}-{scope:016x}.json"))
+                },
+                None => dir.join(format!("claude-cli-session-{safe_model}.json")),
+            }
         })
     }
 
     /// Persist current session state to disk so it survives gateway restarts.
     fn persist_state(&self) {
         let Some(path) = self.state_file_path() else {
+            debug!(
+                "claude-cli session persistence is disabled (no state dir configured); \
+                 the session UUID will not survive a gateway restart"
+            );
             return;
         };
         let uuid = self
@@ -122,6 +159,7 @@ impl ClaudeCliProvider {
     /// after a gateway restart.
     pub fn load_persisted_state(&self) {
         let Some(path) = self.state_file_path() else {
+            debug!("claude-cli session persistence is disabled (no state dir configured)");
             return;
         };
         let data = match std::fs::read_to_string(&path) {
@@ -1916,6 +1954,84 @@ Be concise.\n";
         provider2.load_persisted_state();
         let restored_count = *provider2.last_seen_msg_count.lock().unwrap();
         assert_eq!(restored_count, 3);
+    }
+
+    #[test]
+    fn state_file_is_scoped_by_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_a = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_working_dir("/projects/alpha".into())
+            .with_state_dir(dir.path().to_path_buf());
+        let provider_b = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_working_dir("/projects/beta".into())
+            .with_state_dir(dir.path().to_path_buf());
+
+        assert_ne!(
+            provider_a.state_file_path().unwrap(),
+            provider_b.state_file_path().unwrap(),
+        );
+
+        // Two gateways on different projects must not restore each other's session.
+        let messages = vec![ChatMessage::user("Hello")];
+        provider_a.build_session_args(&messages, "json");
+        provider_b.load_persisted_state();
+        assert!(provider_b.active_session.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn state_file_scope_is_stable_for_same_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_working_dir("/projects/alpha".into())
+            .with_state_dir(dir.path().to_path_buf());
+        let messages = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages, "json");
+        let uuid = provider.active_session.lock().unwrap().clone().unwrap();
+
+        // Simulate a restart with the same configuration.
+        let restarted = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_working_dir("/projects/alpha".into())
+            .with_state_dir(dir.path().to_path_buf());
+        restarted.load_persisted_state();
+        assert_eq!(
+            restarted.active_session.lock().unwrap().clone().unwrap(),
+            uuid
+        );
+    }
+
+    #[test]
+    fn state_file_is_not_written_into_the_working_dir() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let provider = ClaudeCliProvider::new("claude-sonnet-4-6".into())
+            .with_working_dir(work.path().to_string_lossy().into_owned())
+            .with_state_dir(state.path().to_path_buf());
+
+        let messages = vec![ChatMessage::user("Hello")];
+        provider.build_session_args(&messages, "json");
+
+        assert!(
+            provider
+                .state_file_path()
+                .unwrap()
+                .starts_with(state.path())
+        );
+        let leaked: Vec<_> = std::fs::read_dir(work.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "session state leaked into the working directory: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn default_state_dir_is_under_moltis_data_dir() {
+        let dir = ClaudeCliProvider::default_state_dir();
+        assert!(dir.starts_with(moltis_config::data_dir()));
+        assert!(dir.ends_with("claude-cli"));
     }
 
     /// Dump a realistic adapted system prompt to `/tmp/claude-cli-system-prompt.txt`.
